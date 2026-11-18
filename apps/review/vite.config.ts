@@ -1,0 +1,78 @@
+import path from 'path';
+import { defineConfig, type Plugin } from 'vite';
+import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
+import pkg from '../../package.json';
+import { packedApp } from '../../build/pack-app';
+import { DEMO_FILE_CONTENTS } from '../../packages/review-editor/demoData';
+import { katexWoff2Only } from '../../build/katex-woff2-only';
+import { diffsWorkerCatalogs } from '../../build/diffs-worker-catalogs';
+import { webTreeSitterServedWasm } from '../../build/web-tree-sitter-served-wasm';
+
+function demoFileContentPlugin(): Plugin {
+  return {
+    name: 'demo-file-content',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        if (!req.url?.startsWith('/api/file-content')) return next();
+        const filePath = new URL(req.url, 'http://localhost').searchParams.get('path');
+        const entry = filePath ? DEMO_FILE_CONTENTS[filePath] : undefined;
+        if (!entry) return next();
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ oldContent: entry.oldContent, newContent: entry.newContent }));
+      });
+    },
+  };
+}
+
+export default defineConfig({
+  server: {
+    port: 3001,
+    host: '0.0.0.0',
+  },
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
+  plugins: [demoFileContentPlugin(), react(), tailwindcss(), katexWoff2Only(), packedApp()],
+  resolve: {
+    alias: {
+      // Drop the dead Oniguruma WASM (~622 KB base64, inlined twice here: main
+      // thread + worker). See build/shiki-wasm-stub.ts. `resolve.alias` is
+      // shared with the worker build below; `plugins` would not be.
+      'shiki/wasm': path.resolve(__dirname, '../../build/shiki-wasm-stub.ts'),
+      // Highlights, Pierre's second highlighter (WASM), never runs: Plannotator
+      // highlights with Shiki. See build/pierre-highlights-stub.ts.
+      '@pierre/highlights/themes/loader': path.resolve(__dirname, '../../build/pierre-highlights-stub.ts'),
+      '@pierre/highlights': path.resolve(__dirname, '../../build/pierre-highlights-stub.ts'),
+      '@pierre/patches': path.resolve(__dirname, '../../build/pierre-patches-stub.ts'),
+      '@pierre/diffs': '@pierre/diffs-sem',
+      '@': path.resolve(__dirname, '.'),
+      '@plannotator/shared': path.resolve(__dirname, '../../packages/shared'),
+      '@plannotator/ui': path.resolve(__dirname, '../../packages/ui'),
+      '@plannotator/review-editor/styles': path.resolve(__dirname, '../../packages/review-editor/index.css'),
+      '@plannotator/review-editor/tree-styles': path.resolve(__dirname, '../../packages/review-editor/pierreTree.css'),
+      '@plannotator/review-editor/worker-pool': path.resolve(__dirname, '../../packages/review-editor/workerPool.tsx'),
+      '@plannotator/review-editor': path.resolve(__dirname, '../../packages/review-editor/App.tsx'),
+    }
+  },
+  // The Pierre highlight worker (?worker&inline) contains a dynamic
+  // import("shiki/wasm") branch (aliased to a stub above, but still a dynamic
+  // import edge); iife (Vite's default worker format) can't code-split, so
+  // emit the worker as ES with dynamic imports collapsed into the single
+  // inlined bundle.
+  worker: {
+    format: 'es',
+    // Pierre's language and theme catalogs, dead code in its worker (see the plugin).
+    plugins: () => [diffsWorkerCatalogs(), webTreeSitterServedWasm()],
+    rollupOptions: {
+      output: {
+        inlineDynamicImports: true,
+      },
+    },
+  },
+  build: {
+    target: 'esnext',
+    chunkSizeWarningLimit: 100000000,
+    cssCodeSplit: false,
+  },
+});

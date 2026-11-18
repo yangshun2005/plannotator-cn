@@ -1,0 +1,885 @@
+# @plannotator/ui
+
+Plannotator's document UI — markdown rendering, themes, the annotation editor, settings, comments, and layout — as installable building blocks. Published so a separate app (the commercial Workspaces app) can reuse the exact same experience, while Plannotator itself stays unchanged.
+
+Ships with **`@plannotator/core`**: a small, browser-safe, zero-dependency package of the pure utilities and types `ui` builds on (carved out so `ui` can be installed standalone without Plannotator's server code).
+
+## Why this exists
+
+Workspaces needs the same document experience Plannotator has — render docs, annotate, comment, theme, edit — but backed by its own infrastructure (its own storage, auth, realtime, AI). Rather than fork or rebuild, it **installs these packages and plugs in its own backend.** Plannotator passes nothing and behaves exactly as before.
+
+## How it works: host-override seams
+
+Every place the UI talks to a backend (loading a doc preview, saving settings, persisting drafts, streaming comments, listing files, calling AI, etc.) is an **optional seam** that defaults to Plannotator's behavior. A host swaps in its own implementations through **one call at startup**:
+
+```ts
+import { configurePlannotatorUI } from "@plannotator/ui/configure";
+
+configurePlannotatorUI({
+  storageBackend,              // where settings persist
+  identityProvider,           // who the current user is
+  imageSrcResolver,           // how image paths resolve to URLs
+  uploadTransport,             // where pasted/attached images upload to
+  docPreviewFetcher,
+  fileTreeBackend,
+  draftTransport,
+  externalAnnotationTransport, // live/agent comments
+  aiTransport,
+  skillCatalogTransport,       // skill-reference catalog for comment composers
+  skillContentTransport,       // human-only skill contents for feedback injection
+  skillReferenceExport,        // false: no per-comment "Skills referenced" list (a host composing one block per message)
+  skillInstructionsDestination, // what the human-only line says instructions go with (default "your feedback")
+  serverSync,
+  webmcp,                      // browser-agent (WebMCP) provider policy: { enabled, namePrefix }
+  mathRendererLoader,          // how KaTeX loads when no renderer is registered before first math render
+  identityGenerator,           // sync generator behind the default "tater" name (no identityProvider)
+  alertIconRenderer,           // (name) => ReactNode | null for a GitHub alert title line's <!-- icon: name --> (default: null, the type's icon)
+  fenceTheme,                  // (colorTheme, mode) => Shiki theme name | undefined for code fences (default: SHIKI_THEME_MAP, else pierre-dark/light)
+  componentTooltips,           // true: ui's own hover text (components/HostTitle) draws as ui's Tooltip, not a native title (ui 0.53.0; default false)
+  commentCard,                 // true or { pane, foot } (CSS selectors): the comment box is a small card by the words, "Comment" on its button, a chevron that keeps the words; import "@plannotator/ui/comment-card.css" (default false: today's popover)
+  visibleCommentDrafts,        // true: a Viewer comment closed with words keeps its highlight and a floating "Draft" badge that reopens it (default false)
+  digitHexIssueRefs,           // true: digit-only #123456 / #12345678 link as issue refs (when a ref link can be built), not hex swatches (default false)
+  crossRepoRefsWithoutRepo,    // true | { host }: owner/repo#123 links on github.com, or that host, where InlineMarkdown has no githubRepo (default false: plain text); may be set again, mounted text re-renders
+  touchSelectionToolbar,       // true: on a touch screen the selection toolbar goes below the selection (clear of iOS's edit menu), inside the screen, with 44px buttons (default false)
+  refCardTransport,            // (href, ref, signal) => card data for an issue / PR / MR link; with one, useRefHoverCards(rootRef) draws hover cards (default: none, no card, no request). refCardRouteTransport(route) builds one over a server route
+  refCardBitbucket,            // true: Bitbucket Cloud pull request links get a hover card too (default: false, plain links); only for a host whose transport reads them
+  deferOffscreenCodeHighlight, // true: a code fence off screen stays plain until it comes near (highlighted before it shows), the rest in idle time (default false)
+  codeHighlightWorker,         // { html(code, lang, theme) }: with deferOffscreenCodeHighlight, a waiting fence's markup made off the main thread (default: none)
+  loadSettingsFromBackend,     // true: re-hydrate settings from your (synchronous) storageBackend after install, applied last
+  pageMarks,                   // true: <body data-pn-popout> while a PopoutDialog is open, <html data-pn-selection-chooser> while the code review's selection chooser shows, so a host's build can key theme.css's / comments.css's html:has(…) / body:has(…) on them (default false)
+  clickAWord,                  // false: a click on a word in the Viewer's Select input method makes nothing, as before (default true: it highlights the word); the Viewer's own clickAWord prop wins
+});
+```
+
+Anything you don't pass keeps Plannotator's default. A few component-specific overrides (e.g. an "open in editor" diff action) are passed as props where you render that component.
+
+### Resize-handle seams (`ResizeHandle` / `useResizablePanel`)
+
+The sidebar/panel resize handle exposes seams for hosts that want different edge interactions (e.g. no hover reveal, click-to-collapse). All default to today's behavior — pass nothing and it's unchanged.
+
+- **Suppress / restyle the hover reveal.** The inner visible track carries a `[data-resize-track]` attribute (same host-CSS pattern as the collapse button's `[data-collapse]`), and `ResizeHandle` takes a `trackClassName` prop. To kill the pop-in from host CSS:
+  ```css
+  [data-resize-track] { background: none !important; }
+  ```
+- **Click-to-collapse anywhere on the handle.** The handle can't tell a click from a drag-start on its own — the hook owns the pointer state machine. Pass `onClick` to `useResizablePanel`; it fires on pointer-up only when the pointer never traveled past `clickThreshold` (default 4px), so a genuine click on the full-width handle can collapse the panel while drags still resize:
+  ```ts
+  const resize = useResizablePanel({ storageKey, side: "left", onSnapClose: collapse, onClick: collapse });
+  ```
+- **Resize from the keyboard.** `resizeTo(px)` from `useResizablePanel` sets the width the way a finished drag does: clamped to `minWidth`/`maxWidth`, applied, and saved under `storageKey`. A value that is not a finite number is ignored.
+
+Building your own tooltip and removing the built-in double-click reset are host-side concerns (override `onDoubleClick` where you render the handle).
+
+### Page frame (`components/frame`, `frame.css`)
+
+The rail, edges, versions panel, reading line and phone sheets around a document, with host words, storage and colours passed in. See [`components/frame/README.md`](components/frame/README.md).
+
+### Lazy renderers and the eager entries (`utils/math`, `utils/generateIdentity`, `utils/mermaid`; 0.32.0)
+
+The Mermaid runtime, the Graphviz engine, KaTeX and the username dictionary are off the static import graph of `Viewer`, so a host that bundles by route does not download them for a plain markdown read. Graphviz has its own slot since 0.41.0 (`utils/graphviz`, the same shape as Mermaid's: lazy `import('@viz-js/viz')` on the first dot fence, or `setGraphvizRuntime` from the host) and the block shows the source fence under a status until the SVG lands. Mermaid, Graphviz, KaTeX and the dictionary sit behind synchronous slots:
+
+- **Math.** Without registration, a math node renders its TeX as text in the same wrapper (same `data-math-tex` / `data-math-display` / `aria-label` / class names), loads KaTeX via `import('katex')`, and re-renders typeset. To keep math typeset on the very first commit, as Plannotator does, add one line to your entry: `import "@plannotator/ui/utils/math-eager";`. To put KaTeX and its stylesheet on one lazy chunk instead, pass `mathRendererLoader`. The stylesheet remains your job either way (see "Consuming it", step 3). The default `import('katex')` is the only runtime mention of `katex` in the package and lives in `utils/math-default-loader` (0.33.0), called only while no loader is registered; a registered loader is never backfilled by it, though a default load already in flight at registration still fills the slot (pre-existing), so register the loader before the first math render. Chunk emission is static, so a bundler still emits that chunk (never requested) unless you alias the module away; see HANDOFF.md "Lazy renderers and eager entries" for the two-line alias. The Mermaid runtime has its own `import("katex")` for `$$` labels, which leaves a second, shared KaTeX chunk in a host build even with the alias; since 0.34.0 a host redirects that one import (for importers inside the `mermaid` package only) to `@plannotator/ui/utils/mermaid-math-slot`, which typesets the labels through your registered renderer, so one KaTeX chunk remains and it is yours. Recipe and measurement in HANDOFF.md, same section. `resetMathRenderer()` empties the slot only and keeps a registered loader (0.34.0); `setMathRendererLoader(null)` is the explicit way back to the package default.
+- **Mermaid.** Without registration, the first diagram on a page fetches the runtime through `import('mermaid')` and the block shows the source fence under a "Rendering diagram" status until the SVG lands; a failed import is dropped from the memo, re-attempted once after a short delay, and the error panel (with the source) offers Retry, which issues another fresh attempt. **Since 0.40.0 (Mermaid 12.0.0, ELK layout by default, Safari 17.4+) this lazy path is Plannotator's own**: the plan editor no longer imports the eager entry, so a document with no diagram never downloads the runtime in a chunked build. `import "@plannotator/ui/utils/mermaid-eager";` in your entry registers and initializes the runtime at startup instead, if you would rather it never fail separately from the app. Mermaid 12 lays flowchart, state, class, ER and requirement diagrams out with ELK (orthogonal edges, different packing); every generated SVG `id` keeps its 11.x shape, but children of `g.edgePaths` are now in declaration order, so select edges by id (`{renderId}-L_{from}_{to}_{n}`, `{renderId}-edge{n}`), never by DOM position. Details in HANDOFF.md "Mermaid 12 (0.40.0)". **Diagrams follow the colour theme.** Before every render `MermaidBlock` calls `applyMermaidTheme` (`utils/mermaidTheme`), which reads the theme tokens off the document (`--background`, `--foreground`, `--card`, `--border`, `--muted`, `--muted-foreground`, `--primary`, the accent tokens and `--font-sans`; `readThemeTokens`), derives a complete `themeVariables` set for every diagram family from them (`buildMermaidThemeVariables(tokens, mode)`, pure; base theme `dark` under a dark resolved mode, `default` under light; every text-on-fill pair guarded to WCAG 4.5:1 and every line 3:1, rule in the module doc) and runs the global `mermaid.initialize` once per `(palette, mode, shadow amount)` key, re-rendering mounted diagrams when the key changes. The key comes from `useTheme()`, so a host that mounts `ThemeProvider` and ships `theme.css` gets diagrams in its palette with nothing to configure. **The node shadow follows the palette too.** Mermaid 12's neo look shadows every node from a fixed `rgba(185,185,185,1)` grey; the mapping keeps the look and replaces that filter, setting `themeVariables.dropShadow` from the page's own ground at `options.shadowAmount` (0..1, default `DEFAULT_MERMAID_SHADOW_AMOUNT` = **0.7** of Mermaid's geometry; 1 reproduces its `1px 2px 2px` exactly, 0 publishes `dropShadow: false` and the neo rules render `filter: none`). Its polarity follows the page — lighter than the ground on a dark page, darker on a light one, which is what Mermaid's own `insertLookDefs` does and what keeps a shadow visible at all. A host that wants Mermaid's grey passes its own `themeVariables.dropShadow` after ours; one that wants none passes `{ shadowAmount: 0 }`. `mermaidThemeKey(palette, mode, amount?)` appends the amount only when it is not the default, so a host that names none keeps the key it had. **Fallback contract:** with no tokens on the document (no `ThemeProvider`, no `theme.css`) `readThemeTokens` returns `undefined`, nothing is re-initialized, and the runtime keeps the static `MERMAID_CONFIG` it was initialized with, so such a host renders byte-identically to 0.39.0. `MERMAID_CONFIG` keeps its value and meaning (`securityLevel: 'strict'` pinned); the new exports are additive. Honest limit of any in-page retry: a browser records a failed module fetch in its module map for the page lifetime, so a fresh `import()` of the same chunk URL rejects without a request; the retry recovers failures after the fetch (engine instantiation, initialize) and hosts that version chunk URLs. A host that needs recovery from a failed first fetch uses versioned chunk URLs or a `vite:preloadError` reload at app level. The `Viewer`'s lazy blocks (Mermaid, Graphviz, HTML and SVG embeds), the diagram popout and the Source pane each sit in `components/LazyBlockBoundary`: when a chunk cannot load, that one block shows its source under a quiet "Couldn't load this view. Reload" line ("This page was updated. Reload to see this" when the chunk answers 404), and the rest of the page stays mounted.
+- **Identity.** With an `identityProvider` the generator is never called and the word lists stay out of your bundle. Without one, default names come from a small built-in pool of the same `adjective-noun-tater` shape; `import "@plannotator/ui/utils/identity-tater";` registers the full dictionary, or pass your own `identityGenerator`.
+
+Plannotator's own entries import the eager math and identity modules (`math-eager` and `identity-tater` in both `packages/editor/App.tsx` and `packages/review-editor/App.tsx`), which is what keeps math typeset on the first commit and names minted from the full dictionary; neither app imports `mermaid-eager` since 0.40.0, so the Mermaid runtime rides a lazy chunk, both on the share portal and in the plan and review apps (which since #1618 ship as one packed file whose server answers each chunk at `/assets/*`, instead of inlining them). `tests/entry-assets.test.ts` fails if an eager math/identity import is dropped or an eager Mermaid import creeps back. The plan editor also imports `utils/tater-sprites-eager`, which registers Tater mode's sprite sheets for the Viewer and the annotation toolstrip; a host that never turns `taterMode` on leaves it out, and the sheets stay out of its bundle. See HANDOFF.md "Lazy renderers and eager entries" and "Mermaid 12 (0.40.0)".
+
+### Markdown editor extensions + wiki links (`MarkdownEditor` / `InlineMarkdown`)
+
+- **`MarkdownEditor` takes CM6 extensions.** `extensions?: readonly Extension[]` (from `@codemirror/state`) is forwarded verbatim into the underlying editor — the seam for `wikiLinks(config)`, `y-codemirror.next` collab bindings, custom keymaps.
+
+  > **⚠️ Captured once per `documentId` — not reactive.** The engine reads the array a single time at document mount; swapping the array later is silently ignored until a `documentId` change remounts. Pass a stable reference, and feed changing data through extension config callbacks that close over live state (refs/getters) — never through new arrays.
+
+- **`wikiLinks` is re-exported from `@plannotator/ui/components/MarkdownEditor`** together with `WikiLinksConfig`, `WikiLinkSuggestion`, `WikiLinkResolvedTarget`, `WikiLinkStatus`. Import it from there — `@plannotator/atomic-editor` stays off the supported-import list:
+  ```tsx
+  import { MarkdownEditor, wikiLinks } from "@plannotator/ui/components/MarkdownEditor";
+
+  const editorExtensions = [wikiLinks({ suggest, resolve, onOpen })]; // stable reference!
+  <MarkdownEditor markdown={md} documentId={docId} editorHandleRef={ref} extensions={editorExtensions} />
+  ```
+- **`embedPicker(config)` and `embedSlashItem()` are re-exported from the same surface.** Compose the static item into `slashCommands({ items: [...] })` and pass the picker beside it in the stable `extensions` array. `getTargets`, `buildInsertLine`, optional `uploadTarget`, and optional `getNotice` stay live through callbacks. Optional `labels` (`upload`, `empty`, `noMatch(query)`) reword the three rows that say "HTML"; absent keys keep the built-in text. The host owns embed grammar and upload error UI; the package owns filtering, async anchor mapping, single-flight upload state, and paragraph-safe insertion through the re-exported `planEmbedInsert()`.
+- **`linkWidgets(...specs)` and `refreshLinkWidgets` are re-exported from the same surface** (since 0.47.0, engine `@plannotator/atomic-editor` ^0.9.0), with the types `LinkWidgetSpec` and `LinkWidgetLink`. A spec's `match(link)` gets `{ url, text, title?, from, to }` for a single-line `[text](url)` link whose syntax the engine would hide, and returns a CM6 `WidgetType` to draw in the link's place (first non-null spec wins) or `null` for the engine's normal link. The reveal rule (caret, focus, pointer-press freeze, diff ranges) stays the engine's, so the widget comes and goes exactly when the hidden syntax would; `match` is never asked about table-cell links or links wrapping an image. `match` runs on every rebuild: keep it synchronous and side-effect free and implement `eq` on the widget. When the answer changes without a document edit (data arrived after mount), dispatch `view.dispatch({ effects: refreshLinkWidgets.of(null) })`; it changes no text and adds no history entry.
+  ```tsx
+  import { linkWidgets, refreshLinkWidgets, type LinkWidgetSpec } from "@plannotator/ui/components/MarkdownEditor";
+
+  const spec: LinkWidgetSpec = { match: (link) => (isMine(link.url) ? new MyChip(link) : null) };
+  const editorExtensions = [linkWidgets(spec)]; // stable reference!
+  ```
+- **The viewer resolves wiki-links synchronously.** `InlineMarkdown` takes `resolveLinkedDoc?: (target) => { label?; status?: 'active' | 'deleted' } | null` — called with the raw stored target (opaque ids like `doc_01XYZ`, no `.md` normalization). Return a `label` to display live titles (stored label is the fallback, target the last resort); return `status: 'deleted'` for a muted non-link ("Document deleted") instead of a live link. Absent or `null` → rendering is unchanged. Sync-only by design: back it with an in-memory cache.
+
+Wiki links require `@plannotator/markdown-editor ^0.3.2` and `@plannotator/atomic-editor ^0.7.0` (see HANDOFF.md § "Wiki-link seams (0.27.0)"); link widgets require `@plannotator/markdown-editor ^0.5.0` and `@plannotator/atomic-editor ^0.9.0`, which is what 0.47.0 declares (see HANDOFF.md § "Host link widgets (0.47.0)").
+
+### Hover-card providers and plain-text linkers (`utils/refCardProviders`; unreleased, core 0.25.32)
+
+Hover cards beyond GitHub and GitLab, added for the Inbox's Linear cards (#3063). Two global registers, outside `configurePlannotatorUI`; both are empty by default, so a host that registers nothing renders and fetches exactly as before.
+
+- **`registerRefCardProvider({ parse, owns, View?, label? })`** returns an unregister function. `refCardTarget(href)` (`utils/refCard.ts`) asks the providers after `parseForgeRefUrl`, so a provider's links get the same controller, delay, pinning, phone sheet and client cache as a forge link, fetched through the host's own `refCardTransport` (no transport, no card, as before). Its refs travel as `ForgeRef` objects whose `platform` names the provider at runtime. `RefCardView` hands a ref the provider `owns` to its `View` (same `RefCardViewProps`); `label` names the card for screen readers ("Linear issue ENG-123"). `components/RefHoverCard` also exports the card's parts for a provider's own card: `RefCardAvatar`, `RefCardMarkdown` (the safe body renderer: no images, links behind Open · Cancel), `RefCardStateIcon`, `refCardTimeAgo`.
+- **`registerPlainTextLinker((text, previousChar) => spans)`** returns an unregister function. `InlineMarkdown` adds the spans beside bare URLs and code paths, never over one, never inside code or a link's label. Text already on screen re-renders when a linker comes or goes (`usePlainTextLinkers`).
+- **`components/LinearRefCardView`** is the Linear card (`@plannotator/core/linear-ref-card` holds the link parser, `findLinearIdentifiers` and the card fields). Its optional `noKeyText` replaces the no-key line ("Add a Linear API key to see details here.") with the host's own words, such as where its key is set. The description and latest comment go through `htmlAsText` first: a line that would open a raw HTML block or a directive (`:::question`, `:::note`), also inside a quote, list item, alert or heading, is shown as code, so nothing from Linear reaches the HTML renderer or draws a callout or an answerable question card. It then parses the result as the renderer does, checking the content of every block except code and math (so a block type added later is covered), and falls back to one code block for the whole text. The Inbox registers it in `packages/inbox/linearCards.tsx`; no other Plannotator surface does.
+
+### Frozen markdown diff (`MarkdownDiff`)
+
+- **`MarkdownDiff` renders two markdown revisions as a frozen, themed comparison** — the newer revision as the real (uncollapsed) document, deletions projected struck-through in place, char/word change emphasis, a change-count toolbar with prev/next, a clickable keyboard-accessible overview rail, and a changed-line gutter. The surface is never editable (edits are rejected at the state and view boundaries; the content DOM is `contenteditable="false"`).
+- **Same shim pattern as `MarkdownEditor`:** theme resolves from `ThemeProvider` (or pass `mode` directly), `gridEnabled` applies the identical card chrome, and `extensions` composes CM6 extensions — `wikiLinks` included — into the frozen view, with the same captured-once, stable-reference calling convention:
+  ```tsx
+  import { MarkdownDiff } from "@plannotator/ui/components/MarkdownDiff";
+  import { wikiLinks } from "@plannotator/ui/components/MarkdownEditor";
+
+  const diffExtensions = [wikiLinks({ resolve, onOpen })]; // stable reference!
+  <MarkdownDiff originalMarkdown={older} modifiedMarkdown={newer} documentId={docId}
+                editorHandleRef={ref} extensions={diffExtensions} />
+  ```
+- **Bytes are the contract:** `ref.current.getMarkdown()` / `.getOriginalMarkdown()` return the exact input strings (CRLF and trailing whitespace included); `getChangeCount()` / `goToNextChange()` / `goToPreviousChange()` drive review navigation.
+
+Requires `@plannotator/markdown-editor ^0.4.0` and `@plannotator/atomic-editor ^0.8.0` (which adds a `@codemirror/merge` peer — declared by this package). See HANDOFF.md § "Frozen markdown diff (0.28.0)".
+
+### Raw-HTML annotation viewer (`HtmlViewer`)
+
+`components/html-viewer` is supported host surface as of 0.29.0: the overlay-projection annotation viewer for raw HTML (placed comment markers, pinpoint element anchors, shift-click multi-target comments). Its contract is **props plus the validated iframe message protocol** — not `configurePlannotatorUI()`, which only governs the backend surfaces around it. Drive the `annotations` prop (marker numbering derives from its array order); `readOnly` keeps markers painted and clickable while disabling all authoring. **0.29.0 also carries a breaking migration:** highlight.js is gone and `.hljs` selectors are inert — style code via the exported `pn-code` class (`CODE_BLOCK_CLASS` in `utils/codeHighlight`). See HANDOFF.md § "Raw-HTML annotation viewer + syntax-highlighting migration (0.29.0)" before upgrading from 0.28.0.
+
+**`sandbox`** (published in ui 0.55.0): the srcdoc frame's whole `sandbox` attribute. The default is `"allow-scripts allow-modals"`, so a page's `alert`, `confirm` and `prompt` open. A host that shows documents other people wrote passes `sandbox="allow-scripts"`, so no dialog draws over its origin. `hostNavigates` still adds `allow-popups`. A non-string such as `null` gets the default. `""` is the strictest frame: no scripts, so nothing on the page can be annotated. A changed value applies when the frame next loads a document. Do not add `allow-same-origin`. See HANDOFF.md § "`HtmlViewer` `sandbox`".
+
+#### HTML annotation parity seams (0.32.0)
+
+Everything a host needs around `HtmlViewer` to match Plannotator's HTML annotation experience, all additive and all defaulting to today's behavior. Requires `@plannotator/core` 0.25.0 (the `html-anchor` subpath), so install and publish core before ui:
+
+- **`projectHostThreads(threads, { openOnly?, documentLevel?, maxTargets? })`** and **`buildPersistedHtmlAnchor(source, { maxBytes?, maxTargets? })`** from `components/html-viewer` (pure, from `@plannotator/core/html-anchor`): project stored rows onto the `annotations` prop in the order that becomes the marker numbering, and trim a composed comment's anchor for persistence with cap drops and size drops reported separately. A row with nothing restorable projects as a document-level `GLOBAL_COMMENT` by default (`documentLevel: 'global'`, never reported as unanchored) or, with `documentLevel: 'unanchored'`, as a textless page `COMMENT` the unanchored report names. **HTML-only:** the projection carries `originalText`, `htmlAnchor` and `htmlAdditionalTargets`, and pins `blockId` to `""`, offsets to `0` and no `startMeta` / `endMeta`; on the markdown `Viewer` a projected `COMMENT` with quoted text still re-anchors by whole-document text search, but with `blockId` `""` and offsets `0` it loses export ordering (every such row sorts first and ties), the "lines N-M" location label, disambiguation when the same text repeats (first match wins), and the no-flash meta restore; a host that needs those carries `blockId`, the offsets and the web-highlighter metas in its own projection. **Element context rides both helpers** (next publish, #1521): `buildPersistedHtmlAnchor` accepts `elementContext` on its source and `context` on each additional target and writes them back as `PersistedHtmlAnchor.elementContext` / `HtmlAnnotationTarget.context` (serialized after `htmlAdditionalTargets` and after each target's `anchor`, so a row without context stays byte-identical on the wire), and `projectHostThreads` returns both on the projection so a host panel and its per-row Copy see them. Contexts are shed before targets under `maxBytes`, whose 16 KiB default is unchanged. The validator, `parseHtmlElementContext`, lives in `@plannotator/core/html-anchor` and is re-exported from `components/html-viewer`.
+- **`onUnanchoredChange`** is keyed to the bridge's restore (one complete report per document after the restore batch, the empty set included) and complete over the `annotations` prop: textless page rows are reported without being posted, and a locally minted id the host swapped out of its list is not. It replaces a host's `mark-applied` bookkeeping for the unanchored set; the local-to-server mark swap itself stays host-side. **Nothing is delivered before the bridge's first post-restore report for a document (per reload generation):** a prop-side change before that point does not fire the callback, so do not gate host state on a prop-side delivery arriving first; treat the first call as the restore's verdict.
+- **`hooks/useHtmlRefresh({ fetchSnapshot, onSnapshot, onUnanchored?, onResult? })`**: the refresh cycle with the stale-response and document-change guards, backend behind `fetchSnapshot`.
+- **`components/HtmlSurfaceControls`**: the eye / refresh / pen header controls with Plannotator's markup and `labels` overrides.
+- **`AnnotationPanel` `unanchoredIds`**: an "Unanchored" chip on the listed cards.
+- **Links travel on the link guard's port (bridge protocol 2).** A person's link click (`onOpenLink`) reaches the viewer only on a `MessagePort` that a small link guard, the first script in the frame's document, offers once per load with that load's key; the viewer takes one offer per load it started and never hands the frame a port. A `link-click` on the window, a forged `ready`, a second offer and a link with no person's click are ignored. During a person's click the page controls the address sent (it can rewrite or wrap the clicked target), so the host's own scheme and origin checks still decide what it opens. Nothing changes for a host that renders `HtmlViewer`; a host that builds the frame's document itself must change: see "What a host must change for bridge protocol 2" below.
+- **`HtmlViewer` `scrollBehavior`** (`'auto'` for reduced motion) and **`maxAdditionalTargets`** (a product cap the bridge honors too). With the cap enforced upstream (bridge toggle, parent trust boundary on submit and on restore, `projectHostThreads` `maxTargets` on read), a composed comment never reaches the host with more targets than the cap, so a host's own cap-dropped handling (`capDroppedTargets` from `buildPersistedHtmlAnchor`, or a message-counting listener) is unreachable in normal operation; keep it only as a backstop for rows written by an older host build or by another writer. Byte-budget drops (`sizeDroppedTargets`) are a separate path and remain reachable.
+- **`HtmlViewer` `scrollClear`** (optional `() => { left, top, bottom } | null`, frame pixels): where a host's own panel floats over the frame's right side. Read when an annotation is selected and sent as `clear` on `scroll-to`: a mark under the panel scrolls to just below it where the page can scroll and there is room, else it is centred as before. Absent or null: the message and the scroll are unchanged; an older bridge ignores the field.
+- An `ExternalAnnotationTransport` whose `subscribe` emits `snapshot` on a host push keeps `useExternalAnnotations` off its fallback poll.
+
+See HANDOFF.md § "HTML annotation parity seams".
+
+#### What a host must change for bridge protocol 2
+
+Bridge protocol 2 takes a person's link clicks off the window. The bridge no longer posts `plannotator-bridge-link-click` on the window, and the viewer no longer takes one from there.
+
+**A host that renders `HtmlViewer`** (inline bridge or `bridgeScriptUrl`) changes no code. `onOpenLink(href, frame?)` fires as before. On `bridgeScriptUrl`, serve the `bridge-script.asset.js` of the same package version: an older asset reports version 1, the banner shows, and its links are not followed.
+
+**A host that builds the frame's document itself** puts `BRIDGE_SCRIPT` or the asset into its own srcdoc or served page and listens for the bridge's messages. It does these steps for every load it starts:
+
+1. **Mint a key** for every load it starts: every new srcdoc, every new `src`, every reload. Use `const key = newLinkKey()`, which gives 16 random bytes as 32 lowercase hex characters.
+2. **Put the link guard first.** Make `html = injectLinkGuard(html, key)` the last step of building the document. The guard goes right after a leading doctype, or at the very start, so no byte of the page comes before it.
+   - For a served frame, also put the key in the address: `src = withLinkKey(url, key, location.href)`. This adds `__pnk=<key>` to the address.
+   - The guard reads that key in preference to the inline one, and removes it with `replaceState` before the page's scripts run.
+3. **Arm the load before the frame can post.** Keep `key` as the expected key, mark the load "not taken", and close the previous load's port.
+4. **Accept exactly one offer per load.** The guard creates a `MessageChannel` and posts `{ type: LINK_OFFER_MESSAGE, key }` to the parent, transferring one port. In the host's window `message` listener:
+   - Take the offer only when all of these hold: `event.source === iframe.contentWindow`, the type is the offer, the load is not taken, `event.data.key === expected`, and `event.ports[0]` exists. Then mark the load taken and listen on the port.
+   - Otherwise close `event.ports[0]` and ignore the message.
+   - A wrong key does not use up the load. A second offer, even with the right key, is refused.
+5. **Take links from that port only.** Each link arrives as `{ type: LINK_CLICK_MESSAGE, href }`, the raw href, at most 2048 characters.
+   - Treat it as untrusted: refuse control characters, resolve it, and check its scheme and origin.
+   - Never post a port to the frame. Ignore a window `link-click`.
+
+**A host that loads the bridge as an external script** cannot use step 2's inline guard, for example because its CSP blocks inline scripts. Such a host builds its own document with `bridge-script.asset.js`, which is the same code as `BRIDGE_SCRIPT`. It puts the load's key on the bridge's own tag:
+
+```ts
+const key = newLinkKey(); // step 1; arm it before the frame loads (step 3)
+const tag = `<script src="${bridgeAssetUrl}" data-plannotator-link-key="${key}"></script>`;
+iframe.srcdoc = withMyBridgeTag(page, tag); // no injectLinkGuard: the bridge installs the guard from its tag
+```
+
+What the bridge does with the tag:
+
+- When it starts, the bridge reads `data-plannotator-link-key` from its own tag (`document.currentScript`) and installs the link guard with that key.
+- It does this only when no guard ran before it and the session is not live.
+- The guard accepts only 32 lowercase hex characters, which `newLinkKey()` makes.
+- The guard then offers the port exactly as in step 4, and steps 3 to 5 are unchanged.
+
+What the host must get right:
+
+- **A classic script.** Use a classic `<script src>`, not `type="module"`: a module has no `document.currentScript`, so the bridge finds no key.
+- **A served frame.** You can also give the same key in the address (`withLinkKey`). The guard prefers the address's key. Arm the key you put in the address.
+- **No key on the tag.** Without the attribute there is no guard, and no link is followed. Annotation still works.
+- **Where the guard runs.** The guard runs where the tag is. Any script of the page that comes before the tag runs first and can take the guard's place, then send links with no click.
+  - Put the tag before every script of the page that your document allows.
+  - `HtmlViewer`'s `bridgeScriptUrl` path puts it at the end of `<head>`, which has the same limit.
+
+**A host that stays on protocol 1 with the new bridge script fails closed for links.** On a link click:
+
+- The bridge still stops the frame from navigating.
+- In-page `#` links still scroll.
+- The bridge never posts `link-click` on the window. Without a guard in the document it has nowhere to send the link, so no link is followed.
+
+Annotation, selection and the other window messages are unchanged. The bridge's `ready` message reports `protocolVersion: 2`.
+
+Before (protocol 1):
+
+```ts
+iframe.srcdoc = withMyBridge(page);
+window.addEventListener("message", (e) => {
+  if (e.source !== iframe.contentWindow) return;
+  if (e.data?.type === "plannotator-bridge-link-click") openLink(e.data.href);
+});
+```
+
+After (protocol 2):
+
+```ts
+import { LINK_CLICK_MESSAGE, LINK_OFFER_MESSAGE, injectLinkGuard, newLinkKey } from "@plannotator/ui/components/html-viewer";
+
+let load = { key: "", taken: false, port: null as MessagePort | null };
+
+function show(page: string) {
+  load.port?.close();
+  const key = newLinkKey();
+  load = { key, taken: false, port: null }; // armed before the frame can post
+  iframe.srcdoc = injectLinkGuard(withMyBridge(page), key); // last step: the guard goes first
+}
+
+window.addEventListener("message", (e) => {
+  if (e.source !== iframe.contentWindow || e.data?.type !== LINK_OFFER_MESSAGE) return;
+  const port = e.ports[0];
+  if (!port || load.taken || e.data.key !== load.key) return port?.close();
+  load.taken = true;
+  load.port = port;
+  port.onmessage = (m) => {
+    if (m.data?.type === LINK_CLICK_MESSAGE && typeof m.data.href === "string") openLink(m.data.href); // check it first
+  };
+});
+```
+
+**What a page can still do.** During a person's click, the page's own script controls the address that is sent.
+
+- It can rewrite the clicked link's `href`, or wrap the clicked element in a link, before the guard reads it.
+- So a real click anywhere on a hostile page, even a click meant to place a pin, can send any address except `javascript:`.
+- With no person's click, it sends nothing.
+
+The host's own checks are what limit that address:
+
+- `parseBridgeMessage` caps the href at 2048 characters and refuses control characters.
+- In annotate and plan review, `resolveHtmlLinkIntent` decides what the address means:
+  - A relative or root path opens as a linked document through `/api/doc`.
+  - An image opens only from the page's own folder.
+  - Another local file type only shows a toast.
+  - Another origin opens in a new tab (`noopener,noreferrer`).
+  - `data:`, `file:`, `mailto:` and `blob:` are dropped.
+- In the Inbox, a link to a thread on the Inbox's own origin opens in place. Another port, another host or the web opens in a new tab.
+
+So a hostile page can use a person's click to do what a link it drew could do, including moving the Inbox to another thread.
+
+On the inline path the guard is placed without scanning the page, so no script of the page runs before it, whatever the page contains. On `bridgeScriptUrl` the asset runs the guard at the end of `<head>`, so a script the page puts earlier in `<head>` runs first there and can take the guard's place.
+
+#### The bridge script as an asset (`bridgeScriptUrl`; 0.33.0)
+
+By default `HtmlViewer` inlines its 185 KB in-page bridge script into every srcdoc document. A host that serves the package's generated `components/html-viewer/bridge-script.asset.js` as a static file can pass its URL instead:
+
+```ts
+import bridgeScriptUrl from "@plannotator/ui/components/html-viewer/bridge-script.asset.js?url";
+
+<HtmlViewer rawHtml={html} bridgeScriptUrl={bridgeScriptUrl} … />
+```
+
+The srcdoc then carries one classic `<script src>` in the exact place the inline script sat (at the end of `<head>`, before the body), the browser caches the asset across documents, and the bridge's `ready` message carries `BRIDGE_PROTOCOL_VERSION`, which the viewer checks: a stale cached asset (no stamp, or another version) logs one console warning naming both versions and shows a dismissible error banner in the surface (`onBridgeUnavailable` fires too); no `ready` within `bridgeReadyTimeoutMs` (default 5000) shows a timeout banner. The package owns that banner by default (`bridgeErrorDisplay="banner"`); a host that renders its own notice from `onBridgeUnavailable` passes `bridgeErrorDisplay="none"` (0.34.0) and no strip is rendered, while the callback and the console warning are unchanged. The URL is resolved against your document's base (`document.baseURI`) before it is written into the srcdoc, never against the framed page, so a page's own `<base href>` cannot redirect it. Plannotator passes nothing and stays inline; none of this runs on the inline path. **CSP:** the package sets no CSP `<meta>` in the srcdoc document (except `connect-src 'none'` for a page that carries `<meta name="plannotator-network" content="none">`, which Plannotator's servers add to a document opened outside the session's roots; it names no `script-src`), and the frame is an opaque origin so the classic script needs no CORS (no `crossorigin` is set), but a CSP delivered as a header on your page is inherited by the frame: allow `script-src` for the asset's origin. Because the frame is an opaque origin, an asset served with `Cross-Origin-Resource-Policy: same-origin` (common alongside COEP) is blocked; serve it with a CORP that admits cross-origin loads, or without CORP. To also drop the inline literal from your viewer chunk, alias the package's relative `./bridge-script` import (match `/^\.\/bridge-script$/`, never a bare `/\/bridge-script$/`, which would also catch another package's `bridge-script` entry) to the generated `bridge-script.lite` module (see HANDOFF.md § "HTML viewer bridge as an asset").
+
+#### Also blessed in 0.32.0: `shortcuts` and `utils/inputMethod`
+
+- **`@plannotator/ui/shortcuts`**: the declarative keyboard-shortcut engine (`defineShortcutScope`, `useShortcutScope`) and the per-surface scopes, including `useHtmlAnnotateShortcuts` for the Mod+Shift+A Annotate/Interact chord on HTML surfaces. Pure React plus `utils/platform`; no backend.
+- **`@plannotator/ui/utils/inputMethod`**: `getInputMethod(surface)` / `saveInputMethod(method, surface)` / `refreshInputMethodStamp(method)`, the per-surface pinpoint-or-drag preference with its TTL, persisted through the `storageBackend` seam.
+
+#### Toolstrip host props (0.35.0)
+
+`components/AnnotationToolstrip` is supported host surface: the annotation mode toolstrip with per-tool opt-outs, all defaulting to today's rendering.
+
+- **`hideQuickLabel`** omits the Quick Label tool. `StickyHeaderLane` forwards it, so the pinned scroll header stays consistent. It hides the button only — it does not clamp the mode, so keep host mode state out of `'quickLabel'` (including preferences restored through `utils/editorMode`).
+- **`showHelpLink={false}`** for hosts: the default help modal embeds Plannotator's own video walkthroughs.
+- **`hideInputMethodSwitch`** omits the pinpoint/drag input-method switch.
+
+#### Sticky header lane host props
+
+`components/StickyHeaderLane` is the measured compact companion to `Viewer`'s
+`[data-sticky-actions]` cluster. Its defaults preserve Plannotator's ghost-header
+behavior: hidden and inert at rest, then visible with card chrome once stuck.
+
+- **`visibility="always"`** keeps the existing measured left lane visible and
+  interactive at rest as well as while stuck. Resting lanes have no background,
+  border, backdrop, shadow, or new document padding; stuck lanes retain the
+  incumbent chrome. The lane remains zero-height and absolutely positioned, so
+  the host must reserve a clear header-height region; otherwise its visible
+  controls can cover and intercept interaction with document content below.
+- **`sticky={false}`** uses non-sticky positioning, creates no intersection
+  observer, and scrolls away normally. Pass the same value to
+  `Viewer.stickyActions` so the left lane and right action cluster follow one
+  policy. By itself it leaves the default stuck-only lane permanently hidden;
+  combine it with `visibility="always"` for a visible non-sticky header. The
+  measured Viewer-actions width is still reserved because both clusters share
+  the lane at rest before they scroll away together.
+- Wide, tight icon-only, and narrow stacked layouts continue to derive from the
+  wrapper width and the measured action-cluster width. `hideQuickLabel` is still
+  forwarded to the compact toolstrip.
+
+#### Viewer-owned document header
+
+Use `Viewer.annotationHeader` when the compact annotation controls must be
+visible at rest. Viewer then owns one in-flow header containing those controls
+on the left and its existing Global comment / Copy actions on the right:
+
+```tsx
+<Viewer
+  mode={mode}
+  inputMethod={inputMethod}
+  stickyActions={stickyActions}
+  annotationHeader={{
+    onInputMethodChange: setInputMethod,
+    onModeChange: setMode,
+    hideQuickLabel: true,
+  }}
+  // ...the existing Viewer props
+/>
+```
+
+The trailing action cluster keeps full-width labels unless you also pass
+`actionsLabelMode` (`'full' | 'short' | 'icon'`); the header measures the real
+cluster either way, so omitting it costs earlier stacking on narrow columns,
+never breakage.
+
+The header reserves its real responsive height before document content. It
+keeps active labels in the wide layout, switches the compact toolstrip to
+icons in the tight layout, and stacks the two clusters when narrow or wrapped.
+All Viewer badge context moves into the same measured header. With
+`stickyActions={true}` the complete header pins and gains the existing stuck
+chrome; with `false` it remains in flow and scrolls away. The complete header
+has `data-print-hide`, so it contributes no print layout.
+
+As with Viewer's legacy sticky actions and anchor navigation, hosts with a
+custom scroll element must wrap Viewer in `ScrollViewportProvider` from
+`@plannotator/ui/hooks/useScrollViewport` and pass that actual scroll element.
+Without the provider, CSS page stickiness can still apply, but Viewer cannot
+observe the host scroller to add stuck chrome or calculate anchor clearance.
+
+The header reuses Viewer's `[data-sticky-actions]` cluster, so host CSS that
+restyled that selector for the legacy floating bar (negative margins are the
+common case) applies inside the header too and pulls the action cluster out of
+its row. Scope such rules away from the header, e.g.
+`[data-viewer-document-header] [data-sticky-actions] { margin-top: 0; margin-right: 0; }`.
+
+With `stickyActions` on, the legacy bar's `[data-sticky-actions]` cluster is no
+longer the sticky element or a float: it pins inside a zero-height
+`[data-sticky-actions-lane]`, beside a static float that reserves the title's
+wrap space. Both copy the cluster's measured size and margins, so margin
+overrides on `[data-sticky-actions]` still apply. Do not give the cluster
+`position: sticky` and a float together: Firefox narrows float-avoiding blocks
+such as table and code wrappers around a sticky float's stuck position.
+
+The config is intentionally typed rather than a React-node slot. Viewer reuses
+its existing `mode`, `inputMethod`, and `taterMode`; the config supplies only
+the state-change callbacks and optional `hideQuickLabel`. Compact toolstrips
+never render the Plannotator help modal. Hiding Quick Label does not clamp the
+mode, so hosts must still prevent stored `'quickLabel'` state from reaching
+Viewer. Omit `annotationHeader` to preserve the legacy floating action bar
+exactly. The standalone `StickyHeaderLane` remains supported for Plannotator's
+hidden-at-rest ghost lane, but its always-visible mode is an overlay and is not
+the in-flow host integration.
+
+#### Content under the title (`Viewer.belowTitle`; ui 0.54.0)
+
+`belowTitle?: ReactNode` draws a host's node right under the document's
+title, e.g. a references block (pull requests, depends on, links, referenced
+by). Use it instead of inserting into the Viewer's DOM.
+
+- **Where.** When the body's first block is a level-1 heading, right after
+  that heading (`data-placement="below-title"`). Otherwise (a body that opens
+  with a paragraph, a `## heading`, or a `# title` further down) at the top of
+  the body, before the first block and after the frontmatter card
+  (`data-placement="top"`). The heading itself is unchanged.
+- **Outside the document text.** The wrapper `[data-viewer-below-title]` is
+  `annotation-exclude` (no comment starts in it, its text is never searched
+  or quoted), `data-pinpoint-ignore` (pinpoint and Vim skip it),
+  `data-print-hide`, and carries no `data-block-id`; heading slugs, the TOC,
+  exports and share links come from `blocks` and never see it.
+- **Comment positions ignore it.** web-highlighter's `startMeta`/`endMeta`
+  count elements by tag across the whole article, so a `<p>` or `<a>` in the
+  slot would renumber later comments. The highlighter stores and restores
+  positions as if the slot were not there, so the same comment has the same
+  metas with or without the slot, and with any slot contents. A selection
+  from the title that ends in the slot is cut back to the end of the title.
+  Only the wrapper the Viewer draws counts: its attribute carries a per-load
+  value, so a `<div data-viewer-below-title>` an author writes as raw HTML is
+  never taken for it. Match the wrapper by presence
+  (`[data-viewer-below-title]`), not by value.
+- **Absent is absent.** `undefined`, `null` and booleans draw no wrapper; the
+  DOM is exactly the one without the prop.
+
+See HANDOFF.md § "Viewer `belowTitle` (published in ui 0.54.0)".
+
+### Diagram engine (`components/diagram`; 0.41.0)
+
+One renderer slot and one canvas render every Mermaid and Graphviz diagram — the fences in `Viewer` (`MermaidBlock`, `GraphvizBlock`), their popout, and whatever a host renders itself. `DiagramViewer` from `@plannotator/ui/components/diagram` takes `kind`, `source`, `theme` (`{ colorTheme, mode, shadowAmount? }`), `comments: DiagramComment[]` and `onCreateComment(anchor, text, additionalTargets)`; pass `onSave(source) => Promise<{ status: 'ok' } | { status: 'stale', currentSource }>` to get the Source pane (left of the canvas on desktop, under it on the phone; `readOnlySource` shows it without Save), and `sourceOpen` to toggle it. Zoom, pan and fit are the canvas's (wheel, drag, `+` `-` `0`, arrow keys); a click opens the composer at the part beneath while a drag pans (4 px threshold, 10 px for a finger), nothing highlights on a plain mouse-over (the ring under the pointer needs the platform modifier held), every edge carries an invisible 14 px hit path in one top layer and a click is resolved by priority over everything under the pointer (node, then edge, then cluster; an edge label is its edge), a click on no part comments on the whole diagram (kind `diagram`), sequence diagrams are addressable (actors, messages, notes, frames), a saved comment paints a ring and a numbered badge from the array order, and every comment re-resolves against each render through the engine's finder (id, then label, then unanchored — reported through `onUnanchoredChange`). The anchor is `DiagramAnchor` from `@plannotator/core/diagram-anchor` (`{ v: 1, family, kind, id | from + to, label, sourceLine }`, document lines), and Plannotator stores it as `Annotation.diagramAnchor`. Runtime slots: `utils/mermaid` (as before) and `utils/graphviz` (new, same shape, `@viz-js/viz` pinned `3.31.0`), each lazy on first use or filled by the host. `DiagramPopout` is the full-size viewer in the `PopoutDialog` chrome. See HANDOFF.md § "Diagram engine (0.41.0)" for every export, the adapter, the sanitizer and the migration notes.
+
+### Host toolbar seams (0.43.0)
+
+Two opt-in props for hosts that want their own commands and their own people
+inside the annotation UI. Both default to today's behavior — pass neither and
+the toolbar and the comment composer render byte-for-byte what they rendered
+in 0.42.0 (proven by diffing the mounted `outerHTML` against the base commit).
+
+- **`AnnotationToolbar` `selectionActions`** (forwarded by `Viewer` to both its
+  toolbars, and by `HtmlViewer` to the HTML selection toolbar): an array of
+  `{ id, label, detail?, icon?, onSelect(ctx) }`. They render as ONE wand
+  button (`data-selection-actions`) in the slot the quick-labels Zap occupied,
+  opening the package's dropdown below it (arrows + Enter + Escape, nothing
+  preselected until the first arrow). `onSelect` receives
+  `{ text, blockId, startOffset, endOffset, element }` — the same coordinates
+  an annotation created from that selection would carry (`blockId: ''` and
+  `startOffset: 0` on a surface with no blocks, such as raw HTML) — and the
+  toolbar closes. **The package creates no annotation:** what an action does is yours.
+  An empty array renders no button.
+- **`AnnotationToolbar` `selectionActionsIcon`** (forwarded by `Viewer` and
+  `HtmlViewer`): the glyph on the `selectionActions` button, so a host can match
+  the wand it draws elsewhere. Absent means the package's own wand; nothing else
+  about the button changes.
+- **`AnnotationToolbar` `quickLabels`** (default `true`): `false` hides the Zap
+  picker and makes the Alt+digit label shortcuts inert on that toolbar. The
+  one-click 👍 is unaffected, and mode state is still yours to clamp.
+- **`AnnotationToolbar` `onSide`** (forwarded by `Viewer` to its text-selection
+  toolbar only, and by `HtmlViewer`): `(text, context) => void`. A "Side"
+  button (two speech bubbles and the word) after the reactions, with a divider
+  before it and the usual one before ×. Pressing it passes the selected text
+  (what Copy reads) and the same context `selectionActions` get (`blockId`,
+  offsets, `element`), and closes the toolbar; what Side opens is yours. Absent renders no
+  button and no extra divider. The Plannotator Inbox uses it for Ask AI.
+- **`AnnotationToolbar` `sideButton`** (forwarded by `Viewer` and
+  `HtmlViewer` beside `onSide`): `{ icon?: ReactNode; label: string }`. Draws
+  the `onSide` button icon-only, as an ordinary toolbar button the size of its
+  neighbours, in the same place between the same dividers: `icon` is its glyph
+  (absent means the package's two speech bubbles) and `label` its tooltip and
+  accessible name. Absent keeps the two bubbles and the word "Side"; ignored
+  without `onSide`. The press is unchanged. The Plannotator Inbox passes the
+  mark of the agent that owns the thread ("Side chat with Claude").
+- **`inbox-thread/icons` `hostHasMark(host)`**: whether `HostMark` draws that
+  host's own mark and not its neutral code glyph, for a place that would rather
+  draw something else than the neutral glyph. `HostMark` renders as before.
+- **`CommentPopover` `mentionSource`** (0.43.2 adds `heading?` above the list
+  and an optional `avatar?: { url?, initials?, tint? }` per person, drawn before
+  the label; both absent → the 0.43.1 rows): `{ people, emptyNotice?,
+  onMentionsChange?, onPickBlocked? }` over `MentionPerson`
+  (`{ id, kind, label, detail, canOpen }`). Typing `@` at a word boundary opens
+  a portaled picker measured from the textarea; picking inserts the readable
+  `@Label ` token, and the ids ride `onMentionsChange(ids)` plus an optional
+  third `onSubmit(text, images?, mentions?)` argument that is passed **only**
+  when a source is supplied. Deleting a token untags that person. A
+  `canOpen: false` person inserts nothing when you supply `onPickBlocked` (your
+  no-access dialog) and inserts normally when you do not. Not wired to any
+  Plannotator data and not a `configurePlannotatorUI` seam — pass it where you
+  render the composer.
+- **`CommentPopover` mention chips** (0.44.0): with a `mentionSource`, the
+  `@Label` tokens the picker inserted render as chips in the composer's text —
+  the same mirrored overlay skill references use, never a second layer. Each
+  chip span carries `data-mention-token="<person id>"` and
+  `data-mention-kind`, which is `MentionPerson.kind` verbatim — today that is
+  always `user`, because the picker offers users only; `agent` is reserved
+  and matches nothing yet. `MentionSource.tokenClassName?` is appended to the
+  span for your own look. **Metric rule, yours to keep too:** a chip
+  may change color, background, border-radius, box-shadow and text-decoration
+  ONLY — padding, margin, border width, weight, tracking or size move a glyph
+  and drift the caret off the painted text (want a pill? add
+  `box-shadow: 0 0 0 Npx <background>`, which paints without taking space).
+  Only a person you supplied and the author picked is a chip, and editing a
+  byte of the token un-chips it in the same render that drops the id. Two
+  inherited limits: two labels that sanitize to the same token are one token
+  in a plain-text body, so the first person you list owns every occurrence of
+  it; and a restored draft has no chips (and reports no ids) until the author
+  picks again. No source → no overlay element at all.
+- **Agents in the `@` picker** (ui 0.53.1; the Plannotator
+  Inbox's agent tags): `MentionSource.kinds?: ('user' | 'agent')[]` (absent →
+  users only, as before) lets a host offer agents; `MentionSource.matchDetail?:
+  boolean` (absent → true) keeps a query from matching the `detail` line;
+  `MentionPerson.group?: string` draws consecutive people of one group under a
+  heading, each run a `role="group"` labelled by it (absent on every person →
+  the flat list); `MentionSource.renderNotice?: (tagged) => ReactNode` draws a
+  host line under the composer field from the people the draft still tags
+  (`CommentPopover`). All optional; a host passing none renders exactly as
+  before.
+- **`Viewer` / `HtmlViewer` `mentionSource`** (0.43.1): the same prop on the two
+  viewers, forwarded to every comment composer each of them mounts, so a host
+  wires mentions once per surface instead of per composer. The ids the author
+  kept ride onto the created annotation as `Annotation.mentions`
+  (`readonly string[]`, present only when a source was supplied and at least
+  one token survived). It is host data: the package never renders, exports,
+  shares or archives it.
+
+See HANDOFF.md § "Host toolbar seams (0.43.0)" for the grammar, the keyboard
+rules and the threading points, and § "mentionSource on the viewers (0.43.1)"
+for the two viewer props and the annotation field. § "Mention token chips in
+the composer (0.44.0)" covers the chips, the metric rule, the merged-range
+refactor behind them, and the three inherited limits (duplicate labels,
+restored drafts, and a label that is a prefix of another label).
+
+### Float roots
+
+The floats that portal into `document.body` carry a stable hook on their root, so a host can style or mark them (for example `-webkit-app-region: no-drag` under a window's own buttons) without matching Tailwind classes: `.annotation-toolbar` (`AnnotationToolbar`), `[data-table-toolbar]` (`TableToolbar`), `.code-snippet-preview-window` (`CodeSnippetPreview`), `[data-floating-picker]` (`FloatingQuickLabelPicker`), `[data-comment-popover]` and `[data-popover-layer]` (`CommentPopover`). Attributes only: no look or behaviour changes.
+
+### Timeline foot seams (`AnnotationPanel`)
+
+Both opt-in and defaulting to today's behavior.
+
+- **`timelineFooter?: ReactNode`**: the host's own section after the timeline, inside its scroll area, so the cards and the section scroll as one. Absent: no wrapper element.
+- **`hideEmptyMessage?: boolean`**: an empty timeline without "No annotations yet" and its hint, for a host that shows something else there. The way to other files' comments stays.
+
+### Annotation card seams (`AnnotationPanel`; 0.45.0)
+
+Two more opt-in props, both on the panel and both defaulting to today's
+behavior — pass neither and the panel renders byte-for-byte what it rendered
+in 0.44.0 (proven by diffing mounted `outerHTML` against the base commit for
+an empty panel, every card kind, a card in edit mode, `readOnly` and the
+All-files view).
+
+- **`renderCardHeader?: (annotation) => ReactNode`** — the twin of
+  `renderCardFooter`, rendered inside each plan-annotation card's header row
+  after `author · time` and before the built-in edit/delete actions: the place
+  for a status stamp (resolved, needs reply, a reviewer badge). Its wrapper is
+  `[data-annotation-card-header]` and swallows clicks and keydowns, so
+  interacting with your stamp never selects the card. It renders under
+  `readOnly` for the same reason the footer does — a stamp is a read
+  affordance — and, like the footer, only on the OPEN document's cards in the
+  All-files grouped view. Return `null` for a card and no wrapper exists for
+  it; omit the prop and no wrapper exists at all. The header row is one
+  non-wrapping flex line, so keep the stamp compact: the wrapper shrinks but
+  a node that cannot will overflow toward the built-in actions.
+- **`mentionSource?: MentionSource`** — the same source `Viewer` and
+  `HtmlViewer` take (0.43.1), applied to the card's EDIT box, so a comment can
+  be re-tagged after it was written. The grammar, the picker, the keyboard
+  rules and `onPickBlocked` are the ones documented above. Saving an edit
+  calls `onEdit(id, { text, mentions })` **only** when a source is supplied
+  AND at least one person was picked in that edit session whose token
+  survives; otherwise it is the `onEdit(id, { text })` it always was, so an
+  untouched or pick-less edit can never wipe tags the annotation already
+  carries. Reopening the editor starts a fresh session with nobody picked, and
+  `onMentionsChange` follows that session — it reports `[]` once when the
+  editor opens, so treat it as the live picker state, never as the
+  annotation's stored tags.
+  **One difference from `CommentPopover`: no chips** — the token stays plain
+  text, because the chip layer lives in the composer's mirrored overlay and is
+  not worth duplicating; the follow-up is to move the card's edit box onto
+  `ComposerTextarea`.
+
+Neither prop reaches `CodeAnnotation` cards (the review-editor shape), which
+take no `renderCardFooter` either. See HANDOFF.md § "Annotation card header
+slot and mentions on the edit box (0.45.0)".
+
+- **`compareAnnotations?: (a, b) => number`** (ui 0.53.0) — the order of the
+  comment timeline and of each All-files group, for comments with an order of
+  their own (the Inbox sorts a video's comments by the moment they are at).
+  Ties keep creation order; replies still thread under their parent. Omit it
+  and the panel sorts by creation exactly as before.
+- **`title?`, `titleNote?`, `cardParts?: (annotation) => { quote?, images?, text? }`**
+  (ui 0.53.0; `text` ui 0.54.0) — the header's title (default "Annotations")
+  and a quiet note at its right, and per card whether the built-in quote,
+  image row and comment text are drawn (the Inbox's video comments draw the
+  moment and the frame in `renderCardHeader` instead). `text: false` treats
+  the stored text as the host's stand-in, not the person's words: it is not
+  drawn and the card's edit box starts empty (the Inbox's drawing with no
+  words, whose text "See the marked-up image." is for the agent). Omit them
+  and the panel is as before.
+- **`renderCardBody?: (annotation) => ReactNode`** (ui 0.54.0) — the host's
+  own body for a plan-annotation card, drawn where the comment text goes,
+  inside the card (a click on it selects the card). The Inbox draws a
+  drawing with no words as its picture. Omit it and nothing extra is drawn.
+- **Export: `exportLocation`** (ui 0.53.0) — a string a host sets on the
+  COPY of an annotation it hands the exporters (`exportAnnotations`,
+  `exportLinkedDocAnnotations`): one line printed under the entry's heading
+  (the Inbox's `At 1:42 (102.4 s of 7:41)`). Never stored; an annotation
+  without it exports byte-identically.
+
+### Image annotator seams (`components/ImageAnnotator`; ui 0.54.0)
+
+- **`escapeCancels?: boolean`** — Escape closes the drawing screen and accepts
+  nothing; Enter and the ✓ accept; a click outside closes only an empty
+  drawing (strokes are never lost to a stray click); the ✓'s title reads
+  "Save (Enter)". The Inbox passes it (the owner's rule, 2026-10-26). Omit it
+  and Escape, Enter and a click outside all accept, under "Save (Esc)", as
+  plan review has always done.
+- **`hint?: ReactNode`** — the line under the image in place of "Press Esc or
+  Enter or click outside to accept" (the Inbox: "Enter or ✓ adds to your
+  reply · Esc cancels"). Omit it and the line is as before.
+
+### Comment picture uploads per subtree (`CommentUploadContext`; next ui)
+
+`utils/upload` exports `CommentUploadContext`, a React context holding an
+`UploadTransport`. A host whose pictures go to a different place per document
+(the Inbox: the machine a thread is on) provides one around those comment
+boxes. Under it the picture button (`AttachmentsButton`) uploads only through
+it, names the file after the picture (`pictureFileName`: `login-mockup.png`),
+passes `{ onProgress, signal }` as `upload`'s new optional second argument,
+shows "Uploading picture 42%", says "Picture not added" with Retry and × when
+the upload fails, offers no typed path or URL, and holds the comment's Submit
+while a picture is pending (`onPendingChange`). `ImageAnnotator` takes `sourceBlob` (the
+picture's bytes, accepted as they are when nothing is drawn, instead of a
+`fetch` of its `blob:` URL, which a `connect-src 'self'` page refuses); the
+button passes it under the context. `comment-card.css` puts the status on its
+own line over the card's tools. `restoreCommentDraft` takes
+the pictures too (third argument, default none). Without a provider
+(Plannotator's apps) nothing changes: the configured `uploadTransport`, the
+path field and the old upload are as before.
+
+### WebMCP provider (`@plannotator/ui/webmcp`; 0.32.0)
+
+The engine that lets a browser-integrated agent (Chrome/Edge WebMCP, `document.modelContext`) call in-page tools on a document surface. Feature-detected once; a browser without the API sees no registration, no DOM, no network, no timers. Seam: `configurePlannotatorUI({ webmcp: { enabled, namePrefix } })`, default enabled with the `plannotator.` prefix; pass `enabled: false` to keep a host page tool-free, or your own prefix to namespace the tools beside your own. There is deliberately no confirmation seam: the catalog is read-and-comment only (no approve / submit / close tools), and the agent may only edit or remove comments stamped `source: "browser-agent"`.
+
+- `modelContext.ts` is the only file that spells the spec surface (local structural types, no `webmcp-types` dependency). A spec rename is a one-file change.
+- `useToolset({ id, active, build, deps, hooks })` attaches a named tool set to the document registry; handlers read through refs, so re-renders never re-register, and `active: false` aborts every registration (what Plannotator's Settings opt-out drives).
+- `AnnotationChangeTracker` / `buildNudges` are pure (no DOM): per-annotation `seq`, tombstones, a per-tab watermark with `since` override, and the nudge vocabulary every response carries.
+- A host with its own document state builds the same adapter-driven catalog Plannotator uses (`packages/editor/webmcp/documentTools.ts`, `buildDocumentTools(adapter, state, options)`) over its own getters and actions; multi-document pages should register one set whose tools take `path` (the folder-session shape) rather than one set per viewer (duplicate names across sets are skipped with a warning, never replaced).
+- Never register tools inside an untrusted iframe: the raw-HTML viewer's `sandbox="allow-scripts allow-modals"` frame and the live-app frame carry no `allow="tools"`, and that is what keeps a framed page from impersonating the host's tools.
+
+The one additive data-model change that rides with it: `Annotation.inReplyTo` (threaded replies; the panel indents them under the parent, the export nests them, share links drop them).
+
+### Questions in documents (`:::question`; 0.48.0, core 0.25.8)
+
+An agent writes `:::question` (pick one), `:::question-multi` (pick any) or `:::question-text` (free text) blocks in a markdown document; `Viewer` renders each as an answer card (`components/blocks/QuestionBlock`) with native radios / checkboxes, an always-present "Other…", Add note · Skip · Accept recommended. Question and choice text stay selectable and annotatable; a drag across option text never picks it.
+
+- **Grammar, key, answer shape, export section, authoring guide:** `@plannotator/core/question-block` (`parseQuestionBlock`, `indexQuestionBlocks`, `questionKey`, `QuestionAnswer`, `parseQuestionAnswer`, `formatQuestionAnswersSection`, `QUESTION_AUTHORING_GUIDE` — the syntax reference to put in your own agent prompts).
+- **Storage is an annotation.** An answer is one row with `Annotation.questionAnswer` (id `ann-question-<key>`). The Viewer draws answers from its existing `annotations` prop, so your annotation persistence and `draftTransport` carry them unchanged.
+- **One new optional prop:** `Viewer` `onAnswerQuestion?(blockId, answer | null, key)`. Apply it with `upsertQuestionAnswerAnnotation(annotations, blockId, answer, key)` from `utils/questionAnswers` and store the result. Without the prop (or under `readOnly`) the cards render read-only, still showing stored answers.
+- **Export:** `exportAnnotations` / `exportLinkedDocAnnotations` / `exportAnnotationEntry` print answers in an "Answers to your questions" section before the numbered feedback, with no host action.
+- An unparseable block (no prompt) renders as the ordinary directive callout; a ui older than 0.48.0 renders every `:::question` that way.
+- **Progress and panel (optional):** pass `questionRows={buildQuestionPanelRows(blocks, annotations)}` to `AnnotationPanel` for the Questions section (answers then leave the comment timeline), and mount `QuestionProgressChip` with `questionProgress(rows)` / `nextOpenQuestionKey(rows)` / `focusQuestionCard(key)` for the "N/M answered" chip.
+
+See HANDOFF.md § "Questions in documents (0.48.0, core 0.25.8)".
+
+**A host that keeps answers itself (ui 0.49.0, core 0.25.9).** All optional on `Viewer`; Plannotator passes none of them:
+
+- `questionAnswers` (Map or object keyed by the de-duplicated question key): the cards read answers from here instead of from `annotations`.
+- `onSaveQuestionAnswer(key, answer | null)`: explicit save mode. Edits stay a draft in the card, which shows Save answer and Cancel (no Skip); return a promise to hold the draft until the save settles.
+- `saveQuestionAnswerLabel` (string, or `(question) => string`): the Save button's label in explicit save mode. Default "Save answer"; never derived from `Decision: when answered`, since only the host knows whether its save records a decision.
+- `renderQuestionFooter(question, savedAnswer)`: host actions at the right of the card's footer (e.g. "Mark as decision"), live in read-only cards too.
+- Core reads a `Decision: when answered` line after the prompt as `ParsedQuestion.decisionOnAnswer` and a `Decision: [statement](https://…)` line as `ParsedQuestion.decision`; the card shows either. Neither changes the key.
+- `findQuestionBlocks(markdown)` (core) locates each question block by key, line range and exact text, without the UI parser; it shares the block splitter's rules through the new `@plannotator/core/markdown-structure` subpath, so it agrees with what renders.
+
+See HANDOFF.md § "Question host seams (ui 0.49.0, core 0.25.9)".
+
+**Decision recording toggle and status tag (ui 0.52.0).** Also optional on `Viewer`, also unused by Plannotator:
+
+- `questionDecisionRecording(question) => boolean | undefined`: false draws a `Decision: when answered` question's "Records a decision" tag faded (muted-foreground at 55%; the focus ring stays at full strength) with a dotted outline and hides its "Answering this records a decision" row. A recorded decision is never affected.
+- `onToggleQuestionDecisionRecording(key, next)`: makes that tag an `aria-pressed` toggle button; store `next` and return it from `questionDecisionRecording`. Not offered under `readOnly` or in a card without an answer handler.
+- `questionStatusTag: 'none'`: hides the card's own Open / Answered / Settled / Skipped tag so you can draw your own; the decision tags stay.
+- `renderQuestionCard(question, savedAnswer)` (ui 0.53.0): your own card in place of a question's answer card (return `undefined` to keep it), e.g. for a question the asker withdrew; `renderQuestionBelowPrompt(question)`: content under a card's prompt.
+
+See HANDOFF.md § "Question decision toggle and status tag (ui 0.52.0; …)".
+
+**Decision toggle on any question, and a decision-card opener (ui 0.52.1).** Also optional on `Viewer`, also unused by Plannotator:
+
+- `questionDecisionScope?: 'when-answered' | 'any'` (default `'when-answered'`, the 0.52.0 behaviour). With `'any'`, `questionDecisionRecording(question)` also applies to a question with no decision line: a boolean adds the "Records a decision" tag in that state (true also shows the "Answering this records a decision" row); `undefined` leaves it tag-less. Return `false` for "off by default".
+- `onOpenQuestionDecision(key, anchor)`: splits the tag into a diamond switch (`aria-pressed`, "Record as a decision", driven by `onToggleQuestionDecisionRecording`) and the words as a button (`aria-haspopup="dialog"`) that calls this with its own element to anchor your decision card. Offered on and off; not offered under `readOnly`. Without it the whole tag is the toggle, as in 0.52.0.
+
+See HANDOFF.md § "Decision toggle on any question, and an opener for the host's decision card (ui 0.52.1, …)".
+
+**Questions without decision lines (ui 0.53.0, core 0.25.13).** `Viewer` `questionDecisionLines?: boolean` (default `true`, today's behaviour). `false` parses every `:::question` card with core's new `{ decisionLines: false }` option (`parseQuestionBlock(kind, body, options?)`, `indexQuestionBlocks(blocks, options?)`): a `Decision:` line is shown as context, and no card gets a decision tag or row from it. The prompt, key, numbering and choices are the default parse's (the line still ends a choice right above it). For a host that records no decisions; the Plannotator Inbox passes it since Decisions were removed there (2026-10). Every decision seam above is unchanged.
+
+**Answers without comments (ui 0.53.0).** `Viewer` `answerOnly`: annotation authoring and the document actions (Global comment, Copy) are off as under `readOnly`, while question cards and checkboxes keep their handlers, for a host that shows a message to answer, not a document to annotate. See HANDOFF.md § "Viewer `answerOnly` (ui 0.53.0)".
+
+**Comments on an answer-only document (ui 0.53.1).** `Viewer` `textComments`, with `answerOnly`: the text-selection toolbar (comment-only; `textDeletions` adds Delete back, unreleased) and its composer come back, a diagram's parts take comments too (ui 0.56.0), question cards stay out of selection unless the host also passes `questionTextComments` (unreleased, default off), nothing else of authoring does. See HANDOFF.md § "Viewer `textComments` (ui 0.53.1)".
+
+**Local links decided by the host (ui 0.53.0).** `Viewer` `resolveLocalLink`: the host decides what a link to a local path does (open it itself, or draw it as inert text), markdown and raw HTML alike. See HANDOFF.md § "Viewer `resolveLocalLink` (ui 0.53.0)".
+
+**File paths in words, decided by the host (unreleased; the Inbox's "every file a message names opens").** All opt-in, in `components/LocalLinkContext.tsx`; with no provider every path renders exactly as before.
+- `LocalLinkMatchContext`: which link targets `LocalLinkContext`'s resolver is asked about (default `isLocalLinkTarget`, local paths only), in `InlineMarkdown`, raw HTML (`HtmlBlock`) and `PlanCleanDiffView`'s inline text. A host that must keep every non-web link from doing anything (`mailto:`, an editor's scheme) gives a wider test and answers those `unavailable`; an email autolink (`<a@b.com>`) is asked about as `mailto:…` too. `PlanCleanDiffView`'s inline text also reads `ImageResolverContext` and `LocalLinkContext` now (it read neither); with no provider it renders as before.
+- `DiagramSvgAcceptContext` (`components/diagramSvgAccept`): a host's check of every drawn diagram svg (Mermaid and Graphviz) before it reaches the page. `renderDiagram(kind, id, source, theme, { accept })` calls it on the parsed root while it is still in DOMPurify's inert document (before `adoptNode`). A refusal is a `DiagramRenderError` with `refused: true`, and `DiagramBlock` shows the fence's source as code. Absent: every render is exactly as before. The Inbox's Plans page passes one.
+- `CodeSpanMatchContext`: which code spans `CodeSpanContext`'s wrap is asked about (default `isCodeFilePath`); a host that opens documents, pictures and films gives its own test.
+- `BarePathContext` (`{ find, wrap }`): file paths written as plain words. InlineMarkdown asks `find` for each plain run (after cross-repo refs), stops a chunk where a found path starts so a `_` or `@` in it does not cut it, and draws each through `wrap`. Never inside code, links or markup.
+- An `'open'` resolution's `wrap?: (link) => ReactNode`: draws the link inside the host's own hover (its code, say), without the tooltip; the click still calls `open`.
+- `CodeFileView` `lineScroll?: 'vertical'`: a referenced or revealed line is scrolled to up and down only (`scrollCodeLineIntoView`, across Pierre's shadow root), never sliding a long row sideways. Absent: the old scroll, unchanged.
+- `CodeFileView` `commentCard?: 'plain'`: a saved comment's card shows its words as plain text in the sans font (the review app's card: 13 px, soft shadow), with no left bar (a bar reads as a quote), and a sentence-case "Comment · line N" label instead of the uppercase tracked one. Absent: the card is unchanged.
+- `CodeFileView` `commentMarkers?: 'bubble'`: each line's saved comments fold behind one bubble in the gutter of their last line (a count for several), closed at first; a click opens them in a row under the line that pushes the code down (an ease-out on the fold's height, none under reduced motion), the bubble again or the card's Hide closes it (focus stays on the bubble; when a line's last comment is deleted, on the next bubble or the file), and choosing a comment (`selectedAnnotationId`) or saving one from the line composer opens its fold. The gutter keeps the bubble's room whenever the file takes comments (`onAddAnnotation`), and on a coarse pointer the bubble takes taps over 44 × 44 px. It adds rules inside the shadow root (`[data-line-annotation] { height: max-content }`: in a fixed-height pane Pierre's grid otherwise gives the row no height and the card covers the next lines). Absent: every comment drawn open under its line, as before.
+
+### Diff file tree (`components/DiffFileTree`; ui 0.50.0)
+
+A read-only file tree for a list of changed files, to sit beside a host's own per-file diff list. It is Plannotator's code-review tree, not a lookalike: the builder (`utils/diffFileTree`), the folder open/closed hook (`hooks/useDiffFileTreeExpansion`) and the row atoms moved here from `packages/review-editor`, and the review now renders from them.
+
+```tsx
+import { DiffFileTree } from "@plannotator/ui/components/DiffFileTree";
+
+<DiffFileTree
+  files={files}            // { path, oldPath?, status, additions, deletions }[]
+  selectedPath={selected}  // string | null (controlled)
+  onSelect={setSelected}   // (path) => void
+/>
+```
+
+- `status`: `'added' | 'modified' | 'deleted' | 'renamed' | 'binary'` (letters A, M, D, R, B; R's tooltip names `oldPath`).
+- Optional: `defaultExpanded` (`'all'` default, `'none'`, or folder paths; re-applied when the set of files changes, not when an equal array is passed again), `label` (accessible name, default "Changed files"), `className`.
+- Same shape rules as the review: folders first, single-child folder chains merged (`packages/app/src`), a lone root folder holding only files unwrapped, folder +/- summed.
+- `role="tree"` with `treeitem` rows (`aria-level`, `aria-expanded`, `aria-selected`) and one tab stop. While focus is in the tree: ArrowDown/`j`, ArrowUp/`k`, Home, End select files in tree order (the review's keys, opening folders as needed); ArrowRight/ArrowLeft open/close a focused folder, ArrowLeft from a file focuses its folder. Unlike the review, nothing listens on `window`.
+- Styling is the `file-tree-item` rules in `styles.css` plus ThemeProvider tokens; no fetches, no seams.
+
+For a custom row, use the atoms (`DiffFileTreeFolderRow`, `DiffFileTreeFileRowContent`, `ChangeTypeLetter`, `DiffCounts`, `diffFileTreeIndent`) with `buildDiffFileTree` and `useDiffFileTreeExpansion`. Plannotator's review shares the tree builder, the expansion hook and `ChangeTypeLetter`, but since its aligned sidebar it draws its own folder and file rows, so it is no longer an example of these atoms. See HANDOFF.md § "Diff file tree".
+
+### Document contents rail (`components/MarkdownContentsRail`; ui 0.56.0)
+
+Workspaces' contents rail, moved here (approved 2026-10-03 in Workspaces; the move approved 2026-10-30) so Workspaces and the Plannotator Inbox draw the same one. Plan review does not use it.
+
+```tsx
+import { DeferredMarkdownContentsRail } from "@plannotator/ui/components/DeferredMarkdownContentsRail";
+
+// In the document pane, beside the scroll element; it positions itself (fixed) from that element.
+<DeferredMarkdownContentsRail markdown={markdown} scrollViewport={scrollEl} />
+```
+
+```css
+/* Its own stylesheet: import it OUTSIDE any cascade layer, after the host's base reset. */
+@import "@plannotator/ui/contents-rail.css";
+```
+
+- **Shape.** A 36 px dock of tick marks 24 px right of the reading column, vertically centred on the scroll element; it never changes the document's width. At most 10 ticks: a longer document is condensed into 10 spans, each shown by its shallowest heading nearest the span's middle. The current tick has `aria-current="location"`. A tick (or ↑ ↓ ← → Home End, Enter, while a tick has focus) opens a 256 px Contents panel to the LEFT of the dock, over the prose: every heading of levels 1 to 4, its breadcrumb its accessible name (`buildMarkdownContentsModel` also gives each heading a one-line excerpt, the first text after it cut at 180 characters). A pick is marked at once, smooth-scrolls the heading to the 80 px activation line (instantly under reduced motion) and flashes it. Escape on a tick closes the panel; Escape anywhere else closes a panel opened by pointer too (focus stays where it was), except while focus is in an editable control, a dialog, a menu or a listbox, whose Escape it is. It is `preventDefault`-ed and never stopped, so a host's own Escape handler sees it was used. An outside press, or focus leaving the panel, closes it too. No hover reveal, no left/right setting.
+- **When it shows.** At least 4 headings of levels 1 to 4 (`hasContentsRailHeadings` in `utils/annotationHelpers`, over `tocHeadings(blocks, 4)`; a host can ask without loading the rail; a host may lower the count with the rail's optional `minHeadings` and the helper's second argument, which the Plannotator Inbox sets to 2), a scroll element at least 480 px wide, and 68 px free between the reading column's right edge and the scroll element's right edge (its scrollbar excluded): `canShowContentsRail`, `resolveContentsRailGeometry`. A docked column outside the scroll element (comments) therefore makes it yield, never overlap.
+- **Contract with the page.** Positions come from the rendered headings (`[data-block-type="heading"][data-block-id]`, `BlockRenderer`'s); only the rail's own heading ids are read, so an embedded document's headings (namespaced ids) never move the mark. The reading column is `[data-document-read-content]` inside the scroll element unless `contentSelector` names another (the Inbox passes the Viewer's `[data-doc-text-root]`). Any change to the scroll element's DOM re-binds the headings (a host that remounts its reading column, the same headings at new places, is followed).
+- **Which heading is current.** The rail's own scroll math, moved with it into `utils/headingScrollSpy`: each heading's top is cached when the rail measures; every scroll frame a binary search finds the last heading at or above the activation line (`CONTENTS_ACTIVATION_OFFSET`, 80 px below the scroll element's top; Workspaces' was 52), and at the document's end the last heading is current. It needs no band, so a short pane, a jump (scrollbar drag, scroll restore, Home) and scrolling up all mark the right heading.
+- **Loading.** `DeferredMarkdownContentsRail` mounts it after the page is interactive (`requestIdleCallback`, 2 s cap; a zero-delay timer where that is missing) from a lazy chunk.
+- **Styles.** `pn-contents-rail-*` rules in their own stylesheet, `@plannotator/ui/contents-rail.css` (not in `theme.css` or `styles.css`). Import it outside any cascade layer: a later unlayered base reset beats layered rules and puts the ticks over the prose. Plain CSS on the host's tokens, each with a fallback: `--popover`, `--popover-foreground`, `--shadow-menu`, `--geometry-floating-radius`, `--geometry-structure-radius`, `--surface-hover`, `--motion-duration-fast|basic|relaxed`, `--ease-enter|exit`, `--primary`, `--foreground`, `--muted-foreground`. The labels inherit the font size.
+- **Optional host props** (defaults reproduce Workspaces' rail): `blocks` (the host's parsed blocks instead of `markdown`; otherwise one cached parse per body, `utils/blockParse` `parseBlocksShared`), `contentSelector`, `hidden` (a host's own hide choice: draws nothing, still measures), `onAvailableChange(fits)` (whether it can show, after each measure, so a host can offer another way to Contents where it yields), `panelAction` (one control at the right of the open panel's title; the Inbox's Hide).
+- Also moved: `hooks/usePrefersReducedMotion`.
+
+### Scroll-spies: one per surface
+
+Two, both in the package, never two on one surface:
+
+- **Plan review** keeps `hooks/useActiveSection`, unchanged: an IntersectionObserver band from 80 px below the scroll element's top to 20% of its height. `useActiveSection.positions.test.tsx` pins its answers at scroll positions that tell 80 from 52 or 100 px and 20% from 30%.
+- **The contents rail's surface** (the rail, and `DocumentContents` where the rail yields) uses the rail's scroll math, `utils/headingScrollSpy` (above); `hooks/useHeadingScrollSpy(scrollViewport, blockIds)` is it for a list. Both scroll a pick to 80 px, so a pick lands where plan review's does.
+
+### Document contents (`components/DocumentContents`; ui 0.56.0)
+
+A Contents list on the contents rail's surface, for where the rail yields: `TableOfContents` bound to one scroll element, with the rail's headings (levels 1 to 4) and the rail's scroll math (`useHeadingScrollSpy`) marking the heading being read, so the list and the rail never disagree. It reads the current heading at once on mount (a sheet opened mid-document). It draws no chrome; the host titles and places it. It keeps the marked entry in view inside the list's own scroll box.
+
+```tsx
+import { DocumentContents } from "@plannotator/ui/components/DocumentContents";
+
+<DocumentContents blocks={blocks} annotations={annotations} scrollViewport={scrollEl} onNavigate={closeSheet} />
+```
+
+- The headings come from `tocHeadings(blocks, 4)` (`utils/annotationHelpers`), the function `buildTocHierarchy`, plan review's "has entries" check (levels 1 to 3, the default) and the contents rail use.
+- `TableOfContents` takes two optional seams: `scrollViewport`, the element a click scrolls (default: the `ScrollViewportProvider` context, as before), and `maxLevel` (default 3). Plan review passes neither and is unchanged.
+- Used by the Inbox's sheet (a phone, or where the rail yields) and the phone surface; plan review keeps `SidebarContainer`.
+
+### Floating chat window (`components/chat`; ui 0.56.0)
+
+A floating window, a transcript and a composer, as screen code only: the host owns the conversation, the transport and anything saved. It imports nothing from a backend and has no seam in `configurePlannotatorUI`; everything comes in as props.
+
+```tsx
+import { ChatComposer, ChatFrame, ChatTranscript, ChatWindowStore } from "@plannotator/ui/components/chat";
+
+const store = new ChatWindowStore({ initialGeometry: saved, onGeometryChange: save, onOpen: load });
+
+<div className="relative isolate">
+  <ChatFrame store={store} label="Chat" header={() => <span>Chat</span>} onClose={close}>
+    {() => (
+      <>
+        <ChatTranscript messages={messages} status={status} agentName="Agent" />
+        <ChatComposer value={value} onChange={setValue} onSend={send} below={<span>docs/plan.md</span>} />
+      </>
+    )}
+  </ChatFrame>
+</div>
+```
+
+- **Frame.** `ChatFrame` is `absolute`, so its parent is the frame it floats in and is fitted to. Give that parent its own stacking context (`isolate`): the window is `z-40`. Under 392 px of width the window is forced fullscreen, because it cannot float there.
+- **Geometry.** The store holds what the person chose. What is drawn is fitted to the frame at render, so a frame that narrows for a moment changes neither the store nor what you save. `onGeometryChange` runs for each step of a person's drag or resize, so debounce it and flush on unload. It does not run for `initialGeometry`, for `restore`, or when the frame changes size. The store never touches storage.
+- **Keys.** The frame listens to no key. `useChatFrameKeys` is the opt-in map (Mod+J, Shift+Mod+J, Escape). `useChatFrameFocusReturn` returns focus to the element wearing `data-chat-launcher` when focus was in the window.
+- **Composer.** It is controlled and set `onChange` synchronously, or typing and IME input are lost. `onSend` runs while `busy` and with an empty box, so guard those. Enter does not bubble past the React root, so a bubble listener on `window` or `document` does not hear it; capture listeners and native listeners on ancestors still do. Other keys bubble as usual, so an app's own Escape handling still sees them. On a touch keyboard pass `sendOnEnter={false}`: it has no Shift, so otherwise no message can have a second line.
+- **Text.** `ChatTranscript` draws text parts as sanitized markdown. Nothing in message text can carry a class, a `data-*` or `aria-*` attribute, a script or, unless you pass `richMarkdown`, an image, and links open in a new tab with `noopener`. Raw HTML in an agent's text shows as text; the one exception is `<br>`, which stays a line break. Where the sanitizer fails its check on first use, or the text is past a work limit (length, parse time, the size of the HTML it makes, or thousands of characters past ASCII in one paragraph or code block, which is what makes layout slow), the message goes out as plain text. The time limit is a check, not a wall, and it is wall-clock, so a text near it can draw either way. A run of text too costly to parse, such as one holding a very long word, is local: it goes out as literal text and the rest stays formatted, and so does a table with too many cells. Long lines of code in a code block cost nothing. Mark a part `state: 'streaming'` while it grows: a text too costly to draw on every delta then stays plain, and redraws only as it grows by an eighth, so its last words can lag. It renders in full once the part stops streaming or the turn ends. A person can send while an answer streams: keep `status` at `streaming` and the answer above their message keeps streaming, and put a turn that is over in `stopped`. Rendering never throws.
+- **Rich markdown.** `richMarkdown` on `ChatTranscript` (also on `ChatMessageView` and `ChatMarkdown`, and `richMarkdownHtml(text, { literalHtml })` for the string) is the one switch for what `marked` writes for GFM and the default leaves out: images, strikethrough, task checkboxes, link titles and list start numbers. It is off by default and Plannotator never turns it on, because **an image loads a remote address from model text**, which tells that server the person's IP and your origin. **The address can carry anything the model has read**, so text injected into what it reads can send that out with no click: set a CSP `img-src` to the hosts you trust. A relative address loads from your own origin, with your cookies, and `SameSite` does not stop it, so check that no GET route of yours changes anything.
+
+  ```tsx
+  <ChatTranscript messages={messages} status={status} agentName="Agent" richMarkdown />
+  ```
+
+  - A `ChatMarkdown` you return from `renderPart` or inside `renderMessage` hears the transcript's setting. Pass `richMarkdown={false}` to one to say no. Outside a transcript, pass it on each.
+  - It applies to both sides. `![a](url)` in a person's message draws, and HTML they typed stays literal, as without it.
+  - An agent's raw `<img>` draws with `src`, `alt`, `title`, `width` and `height` and nothing else. A raw `<input type="checkbox">` draws disabled, and any other raw `<input>` is removed. A raw comment draws nothing when it stands alone, as a whole block or between words. Inside a longer block of raw HTML it stays text, and an `<img>` written in it still draws. Every other raw tag stays text, as without it: raw HTML is what the limits under **Text** depend on, so `<details>`, `<kbd>`, `<sub>`, `<video>` and `<p align>` do not draw.
+  - `src` follows DOMPurify's rule: `http`, `https`, `ftp`, `ftps`, `mailto`, `tel`, `callto`, `sms`, `cid`, `xmpp`, `matrix`, relative addresses, and `data:` on an image. `javascript:` and the like are taken out.
+  - Every limit under **Text** applies. Those bound the DOM, not the network, so **one text part draws at most 100 images**, counting markdown and raw tags together: past that an image shows its alt text and makes no request. A message with several text parts gets 100 for each. Images load lazily, so one far off screen waits until the person scrolls near it.
+  - A run of inline text with a word past 8,000 characters stays literal. So a `data:` image past that size stays text in markdown or in a sentence. A raw `<img>` on its own line is not inline text: only the 256,000-character limit on the whole text applies to it.
+  - `ChatTranscript` follows an image that loads while the pane is at its live edge. It follows only with its own `richMarkdown` on, so a `ChatMarkdown` of yours that turns it on inside a transcript that does not stays where it is.
+  - Images are sized by Tailwind's preflight (`max-width: 100%; height: auto`), which `styles.css` carries. With no preflight on your page, add your own rule, or a model's `width` can overflow the column.
+- **The person's text as typed** (ui 0.60.0). `keepUserBlankLines` on `ChatTranscript` (also on `ChatMessageView`, and `keepBlankLines` on a `ChatMarkdown` with `literalHtml`) draws the person's messages as the Inbox draws a person's reply: each line break stays a line break, and a paragraph after 2 or more blank lines keeps them (up to 10) instead of one paragraph gap. The gap is drawn as one `<br>` per blank line past the first, before the paragraph, so no `style` or `class` reaches the sanitizer. Blank lines before the first block, inside a list, a quote or a code block are not kept, as in the Inbox. The agent's text is not affected. Off by default; Plannotator never turns it on.
+
+  ```tsx
+  <ChatTranscript messages={messages} status={status} agentName="Agent" keepUserBlankLines />
+  ```
+
+  A `ChatMarkdown` you return from `renderPart` hears the transcript's setting when it has `literalHtml`; pass `keepBlankLines={false}` to one to say no.
+- **Parts.** `renderPart(part, { message, index })` draws a part; return `undefined` to fall through, or `null` to draw nothing. To paint into a text part, return your own `ChatMarkdown`, with the props the transcript gives its own plus yours. Leave out `literalHtml` and a person's `<b>` draws bold:
+
+  ```tsx
+  <ChatMarkdown
+    text={part.text}
+    streaming={part.state === "streaming"}
+    literalHtml={message.role === "user"}
+    messageId={message.id}
+    role={message.role}
+    partIndex={index}
+    annotatable
+    rootRef={ref}
+  />
+  ```
+
+  `data-text-part`, `data-message-id`, `data-message-role`, `data-part-index` and `data-annotatable` on its root are written by this code alone.
+- **Name row.** `agentBadge` draws after the name on the agent's turns, before the Stopped label. `ChatPendingTurn` does not draw it.
+- **Styles.** Nine tokens are not in `theme.css`; `components/chat/index.ts` lists them, and a host defines them in its own `@theme`. Add this folder and `components/ui/{button,textarea}.tsx` to your `@source`. Recipes live in `chatRecipes.tsx` so a `*.tsx` glob reaches them.
+
+### Inbox thread parts (`components/inbox-thread`; ui 0.56.0, in progress)
+
+The Plannotator Inbox's thread display parts, moved here unchanged so the Inbox and Workspaces draw the same thread. They move in small steps, so treat these imports as unstable until the set is complete.
+
+```tsx
+import { Icon, HostMark } from "@plannotator/ui/components/inbox-thread/icons";
+import { GuideCard } from "@plannotator/ui/components/inbox-thread/GuideCard";
+
+<div className="pn-inbox" data-pn-tooltip-root="">
+  <GuideCard guide={guide} onOpen={open} />
+</div>
+```
+
+```css
+/* Its own stylesheet: import it OUTSIDE any cascade layer, after the host's base reset. */
+@import "@plannotator/ui/inbox-thread.css";
+```
+
+- **In the folder so far.** `icons` (`Icon`, `HostMark`, `AuthorMark`, `TabGlyph`, `TailscaleMark`), `Tip` (`Tip`, `isTextCut`), `FileName`, `GuideCard`, `SkillsLine`, `ReaskNote`, `reask` (the pure Re-ask rules), and `SnoozeMenu` (`SnoozeTimes`, the Snooze times and Pick a time views a host renders inside its own Base UI `Menu.Popup`, and `SnoozePicker`, the day and half-hour lists; the times come from `@plannotator/core/inbox-snooze`, and the part only calls `onPick(untilIso)`).
+- **Host-neutral.** A part takes what it shows as props, over core's `InboxMessageWire`, `InboxAttachmentState` and related types. It makes no request and reads no route, hash, cookie or storage. `tests/inbox-thread-parts-host-neutral.test.ts` fails if one does.
+- **Tooltips.** `Tip` portals into the nearest `[data-pn-tooltip-root]`, so put that attribute on your `.pn-inbox` root, the same element: the sheet styles nothing outside that root. Without a `TooltipProvider`, each `Tip` keeps its own 150 ms delay.
+- **Styles.** The parts draw with the Inbox's `ib-` classes, and those rules stay in `packages/inbox/inbox.css`, their only source. `@plannotator/ui/inbox-thread.css` is generated from that file at `prepack` (the pattern of `bridge-script.asset.js`; gitignored, in `files`). It is the whole sheet, about 560 KB raw and 79 KB gzipped, not a subset. What a host has to do is under "Consuming it".
+- **Nothing reaches outside `.pn-inbox`.** The generator scopes every selector to the root with `:where(.pn-inbox)`, which adds no specificity, so the cascade is the Inbox's. It drops the rules that style the page itself (`html`, `body`, `#root`, `html:has(.pn-inbox)`, `:root[data-ib-keyboard-pin]:has(.pn-inbox)`). What stays on `:root` is `--ib-*` tokens only, and every global name (`@keyframes`, `@property`, `::highlight()`, container names) starts `ib-`. The cost: a part that portals outside the root has no look, so portal into the root. `tests/inbox-thread-css.test.ts` checks all of this over the real `inbox.css`, so a new rule there cannot leak unnoticed. A new at-rule the generator does not know, such as `@font-face`, fails `prepack`.
+- **Width.** The sheet carries the Inbox's viewport media queries as they are. In a panel narrower or wider than the Inbox's pane they answer for the window, not the panel. See HANDOFF.md § "Inbox thread stylesheet".
+- **Plannotator.** The parts' old paths in `packages/inbox` re-export them, and the Inbox passes nothing new and does not load the generated sheet. These parts add no Tailwind output: the built CSS of plan review, code review, the Inbox and `styles.css` does not change.
+
+## Consuming it (e.g. from Workspaces)
+
+```bash
+npm install @plannotator/ui @plannotator/core
+```
+
+1. Call `configurePlannotatorUI({ ... })` once at startup with your backend.
+2. Import the stylesheet: `import "@plannotator/ui/styles.css";` (precompiled — no Tailwind wiring needed; if you'd rather run your own Tailwind over the package source, add `@source` globs for `@plannotator/ui`'s `components/`, `hooks/`, and `utils/` dirs in your own CSS — the package doesn't ship its build entry).
+3. **Load the fonts in your app entry** — the stylesheet references `--font-sans` / `--font-mono` but does not ship font binaries (standard for a shared UI package; your app owns font loading). Plannotator uses Inter + Geist Mono:
+   ```ts
+   import "@fontsource-variable/inter";
+   import "@fontsource-variable/geist-mono";
+   ```
+   Or provide your own fonts and set `--font-sans` / `--font-mono` to match.
+   The same policy covers math: KaTeX's stylesheet + fonts are deliberately not in `styles.css` — if you render math, load `katex/dist/katex.min.css` yourself (import, CDN tag, or self-hosted copy; see HANDOFF.md "Math rendering").
+4. Import components: `import { Viewer } from "@plannotator/ui/components/Viewer";`
+5. Build with a bundler that compiles TS/TSX (Vite + React 19 + Tailwind v4). The packages ship **source**, so your bundler compiles them — set `moduleResolution: "bundler"`, `allowImportingTsExtensions`, `jsx: "react-jsx"`.
+6. **If you render the Inbox thread parts** (`components/inbox-thread`):
+   - Import `@plannotator/ui/inbox-thread.css` **outside any cascade layer, after your base reset**, as with `contents-rail.css`. Inside a layer below Tailwind's `base`, Tailwind's preflight beats it.
+   - Keep `styles.css` from step 2: the sheet reads its theme tokens and defines none of them.
+   - Wrap the parts in one root with both markers, `<div className="pn-inbox" data-pn-tooltip-root="">`. The root sets the type, `height: 100%`, `position: relative` and `background: var(--ib-ground)`. The Inbox's pane paints `--card`, so set `background: var(--card)` on your root to match it, or use your panel's own surface. In a panel that scrolls, `height: 100%` stops the background short of tall content, so set `height: auto` on the root too, or make the root the scroller.
+   - Fonts are step 3's. The sheet ships none. With Tailwind, its theme defines `--font-sans` and `--font-mono`, and that beats `styles.css` in a lower layer, so the parts draw in the system font. Set both on your root.
+   - Set the mode on `<html>` as `ThemeProvider` does: the sheet reads `:root.light`. `styles.css` also holds every transition at 0 s until `<html>` has `.transitions-ready`, which `ThemeProvider` adds after mount. A theme switch lands in one frame: while `<html>` has `.pn-theme-switching` (`THEME_SWITCHING_CLASS`), `styles.css` sets every transition's duration and delay to 0 s. `ThemeProvider` holds it on every switch, from the class swap until two frames after the redraw commits. A host that swaps the theme classes on `<html>` itself calls `holdThemeSwitch()` (from `components/ThemeProvider`) just before its swap: it adds the class and removes it two frames later. A part that redraws in the new theme a frame later (it reads the new tokens in `requestAnimationFrame`, as the Pierre diff parts do) calls `extendThemeSwitch()` just before that redraw, which restarts the two frames while a switch is landing and does nothing otherwise. The rule covers the whole page with `!important`: for those 2 to 3 frames after each switch, every transition on the page lands at once, the host's own included (an animated sun/moon icon jumps instead of turning, and the host's colour fades are instant). A transition already running finishes normally.
+   - Portal into the root: the sheet styles nothing outside it.
+
+**Upgrade note: the plan look defaults to Clean.** `gridEnabled` (storage key `plannotator-grid-enabled`) now defaults to `false`, and a stored value counts only with the v2 marker `plannotator-plan-look-v2 = 'resolved'`. Plannotator's chooser and its Settings switch write it. On the first settings read, a v1 marker (`plannotator-plan-look-choice-resolved = 'true'`, or the legacy `plannotator-look-feel-announcement-seen = '2'`) next to a stored `'true'` is moved to Clean once (the stored value is rewritten to `'false'` and the v2 key set to `'notice'`); a v1 marker with Clean becomes `'resolved'` silently. Plannotator's apps then show a one-time notice. That includes the share portal's root and demo pages; only a shared session puts it off. A host that renders no chooser (Workspaces) shows nothing, so its users simply open in Clean, and every user with no marker opens in Clean too. To keep stored values instead, call `markLookAndFeelChoiceResolved()` from `@plannotator/ui/utils/lookAndFeelAnnouncement` before the first settings read, or seed `plannotator-plan-look-v2 = 'resolved'` in your `storageBackend`. A host that writes `gridEnabled` from its own UI should call `markLookAndFeelChoiceResolved()` with it, or the value will not survive a reload.
+
+## Packages & publishing
+
+- `@plannotator/core` — pure utils + types, zero deps, browser-safe (CI enforces no `node:` imports). Published.
+- `@plannotator/ui` — React components/hooks + theme + `configure()`. Depends on an exact published `@plannotator/core` version. Published.
+- `@plannotator/shared`, `@plannotator/ai` — stay private to the monorepo; `shared` re-exports `core`'s modules via shims so Plannotator's internals are untouched.
+- Currently `@plannotator/ui` 0.63.0 (unreleased; 0.62.0 is published) depends exactly on `@plannotator/core` 0.25.22 (unreleased; 0.25.21 is published). `core` is bumped only when something under `packages/core` changes, so `ui` can advance alone. Keep the published core version exact in `packages/ui/package.json`; do not use a `workspace:` protocol there, because a directly published manifest must remain installable outside this monorepo. Bun still links the matching local workspace during development. When both packages change, publish `core` first, then build and publish the UI tarball. `bun run check:sibling-deps @plannotator/ui` (from the repo root; it reads npm) fails while the pinned core isn't on npm. See HANDOFF.md "Publishing & versioning" for the verification command.
+
+## The one rule
+
+**Do not reimplement the document UI from scratch.** A prior from-scratch rewrite broke the app and was reverted. The supported path is always: keep these components as-is and add a seam where a host needs different backend behavior. Never delete working Plannotator code until a human has confirmed parity in the browser.

@@ -1,0 +1,1452 @@
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode, type RefObject } from 'react';
+import { KeyboardSettings } from './KeyboardSettings';
+import { INBOX_TEXT_SIZES } from '@plannotator/core/inbox-types';
+import type { InboxSound } from '../sound';
+import { SoundRow, Switch } from './SoundRow';
+import { type AgentToolHost, type InboxCookieHost, type InboxExperimentalSettings, type InboxStorageModel, type MachineView, type SettingsModel } from '../api';
+import { cookieHostDescription } from '@plannotator/ui/hooks/useCookieHostSetting';
+import { formatBytes, formatCount, plural, tildePath } from '../format';
+import { HARNESSES, type ConnectContext } from '../harnesses';
+import { HostMark, Icon, type IconName } from '../icons';
+import { ConnectPicker } from './ConnectPicker';
+import { AccountsRefresh, AccountsSection } from './Accounts';
+import { LinearKeySettings } from './LinearKeySettings';
+import { AgentsSettings, agentsNeedRestart } from './AgentsSettings';
+import { PromptsSection, promptsSummary } from './PromptsSettings';
+import type { InboxPromptsSettings } from '@plannotator/core/inbox-types';
+import type { InboxAgentsModel, InboxNotifyReach } from '@plannotator/core/inbox-types';
+import type { TestResult } from '../notify';
+import { blockedSteps, browserName, isMac, notifyStatusKind, notifyStatusText, reachText, testMissHint } from '../notifyStatus';
+import { DevicesSection, devicesNeedAttention, usePhones } from './Devices';
+import { CloudAgentsSection } from '../cloud/CloudAgents';
+import { useCloudAgentsGate } from '../cloud/useCloudAgentsGate';
+import { CloudHowButton } from '../cloud/how/CloudHowButton';
+import { MachinesSection } from './Machines';
+import { SidebarTrigger } from '../shell/sidebar';
+import { useInboxPalettes, useInboxTheme } from '../theme';
+import { openSidebarCustomizer } from '../sidebarLayout';
+import { PaletteRow } from './Palettes';
+import { DEFAULT_COLOR_THEME } from '@plannotator/ui/utils/themeRegistry';
+import { chooseTextSize, useInboxTextSize } from '../textSize';
+import { chooseFavicon, useInboxFavicon } from '../faviconChoice';
+import { FAVICON_STYLE_CHOICES, faviconDataUrl } from '@plannotator/core/favicon';
+import { SETTINGS_SECTION_LABEL, SETTINGS_SECTIONS, settingsHash, type SettingsSection } from '../settingsRoute';
+import { VoiceSettings } from './VoiceSettings';
+import { useVoiceSettings, voiceWhere } from '../voice';
+import { RowsSection, rowsSummary, type RowsSectionProps } from './RowsSettings';
+import { useListLook } from '../listLook';
+import { DecisionData } from './DecisionData';
+import type { SystemProjectRow } from '@plannotator/core/inbox-system';
+import { openSystemSetup } from '../system/opener';
+import { systemStateWords } from '../system/projects';
+import { ScheduledSettingsRow } from '../scheduled/SettingsRow';
+
+const TOOL_HOSTS: { host: AgentToolHost; name: string }[] = [
+  { host: 'claude-code', name: 'Claude Code' },
+  { host: 'pi', name: 'Pi' },
+  { host: 'opencode', name: 'OpenCode' },
+  { host: 'dsh', name: 'DeepSeek Harness' },
+  { host: 'cline', name: 'Cline' },
+  { host: 'openclaw', name: 'OpenClaw' },
+  { host: 'hermes', name: 'Hermes Agent' },
+];
+
+const SECTION_ICON: Record<SettingsSection, IconName> = {
+  general: 'settings',
+  rows: 'contents',
+  agents: 'chip',
+  'cloud-agents': 'cloud',
+  accounts: 'user',
+  prompts: 'prompt',
+  devices: 'phone',
+  machines: 'system',
+  voice: 'mic',
+  archived: 'archive',
+  storage: 'disk',
+  about: 'info',
+  capabilities: 'puzzle',
+  activity: 'clock',
+};
+
+/** Projects listed before the rest fold under "N more projects". */
+const SHOWN_PROJECTS = 2;
+/** Settings → Storage says "Counting what is stored…" only when its sizes take longer than this to come. */
+export const STORE_SLOW_MS = 400;
+
+export interface SettingsPageProps {
+  settings: SettingsModel | null;
+  /**
+   * Settings → General's first group, "Getting started" (approval
+   * "inbox-onboarding-tour", returning users): Take the tour. Absent: none.
+   */
+  onTakeTour?: () => void;
+  context: ConnectContext | null;
+  error: string | null;
+  onToggleTool: (host: AgentToolHost, next: boolean) => void;
+  /** Settings → Capabilities → Experimental: decision mode's switch. Absent (or an Inbox that reports no experimental features): no Experimental group. */
+  onToggleExperimental?: (next: boolean) => void;
+  /** Settings → General: "Open Plannotator at plannotator.localhost" (#2184). Absent: no row. */
+  onToggleCookieHost?: (next: boolean) => void;
+  /** `#settings/experimental` (an old link): Capabilities scrolls to its Experimental group and focuses its heading. */
+  landOnExperimental?: boolean;
+  /** Settings → Capabilities → Board: the Board's switch. Absent (or an Inbox without the switch): no Board group. */
+  onToggleBoard?: (next: boolean) => void;
+  /** Settings → Capabilities → Code review (approval "inbox-code-review-direction"). Absent (or an Inbox without it): no row. */
+  onToggleCodeReview?: (next: boolean) => void;
+  /** Settings → Capabilities → Shape (approval "shape-inbox-placement"). Absent (or an Inbox without it): no row. */
+  onToggleShape?: (next: boolean) => void;
+  /** Settings → Capabilities → System (approval "system-inbox"), under Code review and shown only while it is on; in 0.29 also only while System is on (SYSTEM_SETTINGS_ROW_VISIBLE). Absent: no row. */
+  onToggleSystem?: (next: boolean) => void;
+  /** System's projects with their drawing's state, listed under its switch while it is on; null until read. */
+  systemProjects?: SystemProjectRow[] | null;
+  /** Settings → Capabilities → Chapter diagrams, under Code review and shown only while it is on. Absent (or an Inbox without it): no row. */
+  onToggleChapterDiagrams?: (next: boolean) => void;
+  /** Settings → Capabilities → Checklist (thread steps, approval "inbox-thread-steps"). Absent (or an Inbox without it): no row. */
+  onToggleSteps?: (next: boolean) => void;
+  /** Settings → Capabilities → Routines (after Checklist). Absent (or an Inbox without it, Windows among them): no row. */
+  onToggleScheduled?: (next: boolean) => void;
+  /** Settings → Capabilities → Bro mode (approval "bro-mode"). Absent (or an Inbox without it): no row. */
+  onToggleBro?: (next: boolean) => void;
+  /** Settings → Capabilities → Experimental → "Float reply drafts" (approval "inbox-reply-floaters", off by default). Absent (or an Inbox without it): no row. */
+  onToggleFloatDrafts?: (next: boolean) => void;
+  /** Settings → General → When an agent asks you → the Mark read warning (the owner's ask, 2026-11-10). Absent (or an Inbox without it): no row. */
+  onToggleMarkReadWarning?: (next: boolean) => void;
+  /** Over your tailnet: the switch, and whether a change is in flight. */
+  onToggleTailscale: (next: boolean, replaceExposed?: boolean) => void;
+  tailscaleBusy: boolean;
+  permission: NotificationPermission | 'unsupported';
+  onToggleNotifications: (next: boolean) => void;
+  /** Whether any open Inbox tab can show a notification (the server's live report). */
+  notifyReach?: InboxNotifyReach | null;
+  /** Raise a test notice now (notify.ts `sendTest`). */
+  onTestNotification?: () => Promise<TestResult>;
+  /** Delete a thread or a project with its files as they were sent (blobs no other thread uses). */
+  onDeleteThread: (threadId: string) => Promise<void>;
+  onDeleteProject: (projectId: string) => Promise<void>;
+  /**
+   * Settings → Storage's sizes (GET /api/inbox/settings/storage): null until first read. Kept by the window for the
+   * visit, so a second visit shows them at once while `onReadStore` reads them again.
+   */
+  store?: InboxStorageModel | null;
+  /** The last storage read failed and there is nothing to show: why. */
+  storeError?: string | null;
+  /** Read the storage sizes again: asked each time Storage is shown, never for another section. */
+  onReadStore?: () => void;
+  /** Settings → About: the version, Check now and the two update switches (components/Updates.tsx). */
+  about?: ReactNode;
+  /** The About nav row's dot: a new version is available, ready or failed, or checking has failed for hours. */
+  aboutDot?: boolean | 'check-failing';
+  /**
+   * Settings → General's first row: the version and the sidebar's update
+   * action, Check now (components/Updates.tsx GeneralUpdateRow). Absent: none.
+   */
+  updateRow?: ReactNode;
+  /** The question sound's row, under the notifications switch (sound.ts). */
+  sound?: InboxSound;
+  /** Settings → Archived: the archived threads (components/Archived.tsx). */
+  archived?: ReactNode;
+  /**
+   * Settings → Activity's chart: the threads hour by hour (components/ActivityChart.tsx), above the decision numbers
+   * (components/DecisionData.tsx). Absent: Activity shows the decision numbers alone.
+   */
+  activity?: ReactNode;
+  /** How many threads are archived, for the nav's count; null while unknown. */
+  archivedTotal?: number | null;
+  /** Settings → Rows' "Your list": the person's newest rows, with the names and away machines the list draws them by. Absent: examples. */
+  rowsPreview?: Pick<RowsSectionProps, 'rows' | 'projectNames' | 'awayMachines'>;
+  /** The section on screen (`#settings/<section>`); null is `#settings` alone: General, or the list of sections on a phone. */
+  section?: SettingsSection | null;
+  /** `#settings/devices/pair`: Pair a phone is open. */
+  pairing?: boolean;
+  /** Open a section (null: the phone's list of sections). */
+  onSection?: (section: SettingsSection | null) => void;
+  onPairing?: (open: boolean) => void;
+  /** "← Inbox": back to where the person was before Settings. */
+  onBack?: () => void;
+  /** Settings did not load: read it again. */
+  onRetry?: () => void;
+  /** One screen at a time (phone.ts): the list of sections, then a section with "‹ Settings". */
+  phone?: boolean;
+  /** Settings → Agents (components/AgentsSettings.tsx): the agents on this computer; null while unread. */
+  agents?: InboxAgentsModel | null;
+  onAgents?: (next: InboxAgentsModel) => void;
+  /** Settings → Prompts saved a change: the server's model of it. */
+  onPrompts?: (next: InboxPromptsSettings) => void;
+  /**
+   * Settings → Machines (components/Machines.tsx): every machine the merged view knows, this one included. Absent or
+   * empty: an Inbox that cannot link machines, and the section is not listed.
+   */
+  machines?: MachineView[];
+  /** A link or an Unlink happened: read the machines again. */
+  onMachinesChanged?: () => void;
+  /** Open a machine's update dialog. Absent on a page that offers no updates. */
+  onMachineUpdate?: (machineId: string) => void;
+}
+
+/**
+ * "Open Plannotator at plannotator.localhost" (#2184), the switch plan review,
+ * code review and annotate show in their Settings too: config.json
+ * `urlHost: "plannotator.localhost"`. Locked (with the reason) while
+ * PLANNOTATOR_URL_HOST is set or config.json holds another `urlHost`, which it
+ * never replaces. From the owner's
+ * phone (`remote`) it is still the computer's browser that the switch changes, so the heading says so.
+ */
+function CookieHostGroup({ cookieHost, remote, onToggle }: { cookieHost: InboxCookieHost; remote: boolean; onToggle: (next: boolean) => void }) {
+  const locked = cookieHost.env !== null || cookieHost.url_host !== null;
+  const state = cookieHost.env !== null ? 'locked-env' : cookieHost.url_host !== null ? 'locked-url-host' : cookieHost.on ? 'on' : 'off';
+  return (
+    <section className="ib-sgroup" data-settings-cookie-host={state} aria-labelledby="ib-g-browser">
+      <h2 id="ib-g-browser">{remote ? 'The computer’s browser' : 'This browser'}</h2>
+      <div className="ib-card">
+        <div className="ib-prow">
+          <span className="ib-txt">
+            <span className="ib-l" id="ib-cookie-host-label">
+              Open Plannotator at plannotator.localhost
+            </span>
+            <span className="ib-desc">{cookieHostDescription({ on: cookieHost.on, env: cookieHost.env ?? undefined, urlHost: cookieHost.url_host ?? undefined }, { inbox: true })}</span>
+          </span>
+          <span className="ib-ctl">
+            <Switch on={cookieHost.on} labelledBy="ib-cookie-host-label" disabled={locked} onClick={() => onToggle(!cookieHost.on)} />
+          </span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+const THEME_CHOICES = [
+  { id: 'light', label: 'Light', icon: 'sun' },
+  { id: 'dark', label: 'Dark', icon: 'moon' },
+  { id: 'system', label: 'Match system', icon: 'system' },
+] as const;
+
+/**
+ * General (design of record `.product/approved/inbox-settings-tabs/`):
+ * Appearance (light, dark, or match this computer; the text size; and the
+ * palette for each half, Plannotator's one theme preference, so plan review
+ * follows it too), and how the Inbox gets your
+ * attention when an agent asks: desktop notifications and the sound.
+ */
+function GeneralSection({
+  settings,
+  permission,
+  onToggleNotifications,
+  notifyReach,
+  onTestNotification,
+  sound,
+  onToggleCookieHost,
+  onTakeTour,
+  updateRow,
+  onToggleMarkReadWarning,
+}: {
+  onToggleCookieHost?: (next: boolean) => void;
+  /** The Mark read warning's switch (absent from an Inbox without it: no row). */
+  onToggleMarkReadWarning?: (next: boolean) => void;
+  onTakeTour?: () => void;
+  updateRow?: ReactNode;
+  settings: SettingsModel;
+  permission: NotificationPermission | 'unsupported';
+  onToggleNotifications: (next: boolean) => void;
+  notifyReach?: InboxNotifyReach | null;
+  onTestNotification?: () => Promise<TestResult>;
+  sound?: InboxSound;
+}) {
+  const { mode, choose } = useInboxTheme();
+  const textSize = useInboxTextSize();
+  // Null from an Inbox that predates the setting: no row.
+  const favicon = useInboxFavicon();
+  const notificationsOn = settings.notifications.enabled && permission === 'granted';
+  const status = notifyStatusKind(settings.notifications.enabled, permission);
+  const browser = browserName();
+  const address = typeof window !== 'undefined' ? window.location.host : '';
+  const [tested, setTested] = useState<TestResult | null>(null);
+  const reach = notifyReach ?? settings.notify_reach ?? null;
+  const reachLine =
+    permission === 'unsupported'
+      ? null
+      : reachText({ here: notificationsOn, enabled: settings.notifications.enabled, reach, origin: typeof window !== 'undefined' ? window.location.origin : '' });
+  return (
+    <>
+      {updateRow}
+      {onTakeTour && (
+        <section className="ib-sgroup" data-settings-tour="" aria-labelledby="ib-g-start">
+          <h2 id="ib-g-start">Getting started</h2>
+          <div className="ib-card">
+            <div className="ib-prow">
+              <span className="ib-txt">
+                <span className="ib-l">Tour</span>
+                <span className="ib-desc">See how the Inbox works through real threads from building Plannotator · 2 min</span>
+              </span>
+              <span className="ib-ctl">
+                <button type="button" className="ib-btn" onClick={onTakeTour} data-settings-take-tour="">
+                  <Icon name="play" size={14} />
+                  Take the tour
+                </button>
+              </span>
+            </div>
+          </div>
+        </section>
+      )}
+      <section className="ib-sgroup" data-settings-theme={mode} aria-labelledby="ib-g-appearance">
+        <h2 id="ib-g-appearance">Appearance</h2>
+        <div className="ib-card">
+          <div className="ib-prow">
+            <span className="ib-txt">
+              <span className="ib-l" id="ib-theme-label">
+                Theme
+              </span>
+              <span className="ib-desc">
+                Also plan review, code review and annotate.
+              </span>
+            </span>
+            <span className="ib-ctl">
+              <span className="ib-seg" role="radiogroup" aria-labelledby="ib-theme-label">
+                {THEME_CHOICES.map((choice) => (
+                  <label key={choice.id} className="ib-seg-o" data-on={mode === choice.id ? '' : undefined}>
+                    <input type="radio" name="ib-theme" value={choice.id} checked={mode === choice.id} onChange={() => choose(choice.id)} />
+                    <Icon name={choice.icon} size={14} />
+                    {choice.label}
+                  </label>
+                ))}
+              </span>
+            </span>
+          </div>
+          <div className="ib-prow" data-settings-text-size={textSize}>
+            <span className="ib-txt">
+              <span className="ib-l" id="ib-text-size-label">
+                Text size
+              </span>
+              <span className="ib-desc">{textSize === 14 ? 'The default. Applies to the whole Inbox.' : 'Applies to the whole Inbox; 14 is the default.'}</span>
+            </span>
+            <span className="ib-ctl">
+              <span className="ib-seg" role="radiogroup" aria-labelledby="ib-text-size-label">
+                {INBOX_TEXT_SIZES.map((size) => (
+                  <label key={size} className="ib-seg-o" data-on={textSize === size ? '' : undefined}>
+                    <input
+                      type="radio"
+                      name="ib-text-size"
+                      value={size}
+                      checked={textSize === size}
+                      aria-label={`${size} px`}
+                      onChange={() => void chooseTextSize(size)}
+                    />
+                    {size}
+                  </label>
+                ))}
+              </span>
+            </span>
+          </div>
+          {/* The sidebar's layout (approval "inbox-sidebar-customize"): the keyboard's way to the Customize panel, and the phone's. */}
+          <div className="ib-prow" data-settings-sidebar="">
+            <span className="ib-txt">
+              <span className="ib-l" id="ib-sidebar-label">
+                Sidebar
+              </span>
+              <span className="ib-desc">What shows, and where. Also from a right-click on the sidebar.</span>
+            </span>
+            <span className="ib-ctl">
+              <button
+                type="button"
+                className="ib-btn"
+                aria-describedby="ib-sidebar-label"
+                aria-haspopup="dialog"
+                onClick={(event) => openSidebarCustomizer(event.currentTarget)}
+                data-settings-customize-sidebar=""
+              >
+                Customize…
+              </button>
+            </span>
+          </div>
+          <PaletteRow />
+          {favicon && (
+            <div className="ib-prow" data-settings-favicon={favicon}>
+              <span className="ib-txt">
+                <span className="ib-l" id="ib-favicon-label">
+                  Favicon
+                </span>
+                <span className="ib-desc">The icon on this tab and on the installed app. Also plan review, code review and annotate.</span>
+              </span>
+              <span className="ib-ctl">
+                <span className="ib-seg" role="radiogroup" aria-labelledby="ib-favicon-label">
+                  {FAVICON_STYLE_CHOICES.map((choice) => (
+                    <label key={choice.id} className="ib-seg-o" data-on={favicon === choice.id ? '' : undefined}>
+                      <input
+                        type="radio"
+                        name="ib-favicon"
+                        value={choice.id}
+                        checked={favicon === choice.id}
+                        onChange={() => void chooseFavicon(choice.id)}
+                      />
+                      <img src={faviconDataUrl(choice.id)} alt="" width={16} height={16} className="ib-favicon-o" />
+                      {choice.label}
+                    </label>
+                  ))}
+                </span>
+              </span>
+            </div>
+          )}
+        </div>
+      </section>
+      <KeyboardSettings />
+      <section className="ib-sgroup" data-settings-notifications="" aria-labelledby="ib-g-attention">
+        <h2 id="ib-g-attention">When an agent asks you</h2>
+        <div className="ib-card">
+          <div className="ib-prow">
+            <span className="ib-txt">
+              <span className="ib-l" id="ib-notify-label">
+                Desktop notifications
+              </span>
+              <span className="ib-desc" data-notify-status={status} aria-live="polite">
+                {notifyStatusText(status, browser)} ({address}) · new threads and questions
+              </span>
+            </span>
+            <span className="ib-ctl">
+              {status === 'not-allowed' && settings.notifications.enabled && (
+                <button type="button" className="ib-btn ib-pri ib-sm" data-notify-allow="" onClick={() => onToggleNotifications(true)}>
+                  Allow
+                </button>
+              )}
+              <Switch
+                on={notificationsOn}
+                labelledBy="ib-notify-label"
+                disabled={permission === 'unsupported' || permission === 'denied'}
+                onClick={() => onToggleNotifications(!notificationsOn)}
+              />
+            </span>
+          </div>
+          {permission === 'denied' && (
+            <div className="ib-callout ib-warn ib-in-card" data-notifications-blocked="">
+              <Icon name="warn" />
+              <span>
+                <b>Blocked in {browser} for {address}.</b> {blockedSteps(browser, address)}
+              </span>
+            </div>
+          )}
+          {status === 'on' && (
+            <div className="ib-prow" data-notify-test="">
+              <span className="ib-txt">
+                <span className="ib-l">Test notification</span>
+                <span className="ib-desc" aria-live="polite">
+                  {tested === 'sent'
+                    ? testMissHint(browser, isMac())
+                    : tested === 'failed'
+                      ? 'The browser would not show it. Reload this page and try again.'
+                      : tested === 'not-allowed'
+                        ? `Not allowed in ${browser} for this address any more.`
+                        : `${browser} can say it allows notifications while your system hides them: send one to see.`}
+                </span>
+              </span>
+              <span className="ib-ctl">
+                <button
+                  type="button"
+                  className="ib-btn ib-sm"
+                  data-notify-test-send=""
+                  disabled={!onTestNotification}
+                  onClick={() => void onTestNotification?.().then(setTested)}
+                >
+                  Send a test notification
+                </button>
+              </span>
+            </div>
+          )}
+          {reachLine && (
+            <div className="ib-prow" data-notify-reach={reachLine.yes ? 'yes' : 'no'}>
+              <span className="ib-txt">
+                <span className="ib-l">Notifications reach you</span>
+                <span className="ib-desc">{reachLine.text} With no Inbox tab open, nothing can notify you.</span>
+              </span>
+            </div>
+          )}
+          {sound && <SoundRow sound={sound} />}
+          {settings.mark_read_warning && onToggleMarkReadWarning && (
+            // The warning before a Mark read that sets questions aside (components/MarkReadWarning.tsx): its "Don't
+            // show this again" turns this off, and this turns it back on.
+            <div className="ib-prow" data-settings-mark-read-warning="">
+              <span className="ib-txt">
+                <span className="ib-l" id="ib-mark-read-warning-label">
+                  Warn before Mark read sets questions aside
+                </span>
+                <span className="ib-desc">Asks first when marking read would close open questions and tell the agent not to wait on them.</span>
+              </span>
+              <span className="ib-ctl">
+                <Switch on={settings.mark_read_warning.on} labelledBy="ib-mark-read-warning-label" onClick={() => onToggleMarkReadWarning(!settings.mark_read_warning!.on)} />
+              </span>
+            </div>
+          )}
+        </div>
+        <div className="ib-note">
+          <Icon name="info" />
+          Notifications are allowed per address, so a browser on another device asks once there.
+        </div>
+      </section>
+      {settings.cookie_host && onToggleCookieHost && <CookieHostGroup cookieHost={settings.cookie_host} remote={settings.via === 'tailnet'} onToggle={onToggleCookieHost} />}
+    </>
+  );
+}
+
+/**
+ * Whether Settings → Capabilities offers the System switch to everyone (approval "system-inbox", addendum 2026-11-08:
+ * in 0.29 System stays off and hidden; it turns on only by config.json `inboxSystem: true`, for testing). False: the
+ * row shows only while System is already on, so a tester who turned it on in config.json can turn it off here. Set it
+ * to true when System is announced.
+ */
+export const SYSTEM_SETTINGS_ROW_VISIBLE = false;
+
+/**
+ * Capabilities (the owner, 2026-10-27): the switches that turn a whole
+ * feature on or off, moved out of General. First the main ones, today the
+ * Board (config.json `inboxBoard`, POST /api/inbox/settings `{ board: { on } }`),
+ * then the Experimental group ("Experimental just needs to be within
+ * Capabilities, under the main list"): each experimental feature's switch,
+ * off unless turned on, locked while PLANNOTATOR_EXPERIMENTAL decides; today
+ * decision mode. Same words as each had before.
+ */
+function CapabilitiesSection({
+  board,
+  onToggleBoard,
+  steps,
+  onToggleSteps,
+  scheduled,
+  onToggleScheduled,
+  codeReview,
+  onToggleCodeReview,
+  shape,
+  onToggleShape,
+  system,
+  onToggleSystem,
+  systemProjects,
+  chapterDiagrams,
+  onToggleChapterDiagrams,
+  bro,
+  onToggleBro,
+  floatDrafts,
+  onToggleFloatDrafts,
+  experimental,
+  onToggleExperimental,
+  experimentalHeading,
+}: {
+  board: { on: boolean } | null;
+  onToggleBoard?: (next: boolean) => void;
+  /** The checklist (thread steps, approval "inbox-thread-steps"), null on an Inbox without it. */
+  steps: { on: boolean } | null;
+  onToggleSteps?: (next: boolean) => void;
+  /** Routines, null where the Inbox has no switch for them. */
+  scheduled: { on: boolean; login?: 'added' | 'unavailable' } | null;
+  onToggleScheduled?: (next: boolean) => void;
+  /** Code review in the Inbox (approval "inbox-code-review-direction"), null on an Inbox without it. */
+  codeReview: { on: boolean } | null;
+  onToggleCodeReview?: (next: boolean) => void;
+  /** Shape (approval "shape-inbox-placement"), null on an Inbox without it. */
+  shape: { on: boolean } | null;
+  onToggleShape?: (next: boolean) => void;
+  /** System (approval "system-inbox"): null unless Code review is on. */
+  system: { on: boolean } | null;
+  onToggleSystem?: (next: boolean) => void;
+  systemProjects?: SystemProjectRow[] | null;
+  /** Chapter diagrams: null unless Code review is on (the server sends it only then). */
+  chapterDiagrams: { on: boolean } | null;
+  onToggleChapterDiagrams?: (next: boolean) => void;
+  /** Bro mode (approval "bro-mode"), null on an Inbox without it. */
+  bro: { on: boolean } | null;
+  onToggleBro?: (next: boolean) => void;
+  /** Floating reply drafts (approval "inbox-reply-floaters", off by default), null on an Inbox without the switch. */
+  floatDrafts: { on: boolean } | null;
+  onToggleFloatDrafts?: (next: boolean) => void;
+  experimental: InboxExperimentalSettings | null;
+  onToggleExperimental?: (next: boolean) => void;
+  /** The Experimental group's heading, where `#settings/experimental` lands. */
+  experimentalHeading: RefObject<HTMLHeadingElement | null>;
+}) {
+  const boardRow = board && onToggleBoard;
+  const stepsRow = steps && onToggleSteps;
+  const scheduledRow = scheduled && onToggleScheduled;
+  const codeReviewRow = codeReview && onToggleCodeReview;
+  const shapeRow = shape && onToggleShape;
+  // System's row (see SYSTEM_SETTINGS_ROW_VISIBLE): while hidden, it shows only once System is on, and then stays for
+  // as long as Capabilities is open, so turning System off here does not pull the row out from under the click.
+  const [systemRowSeen, setSystemRowSeen] = useState(false);
+  if (system?.on === true && codeReview?.on === true && !systemRowSeen) setSystemRowSeen(true);
+  const systemRow = system && onToggleSystem && codeReview?.on === true && (SYSTEM_SETTINGS_ROW_VISIBLE || system.on || systemRowSeen);
+  // Chapter diagrams sits under Code review, as System does, and shows only while Code review is on.
+  const chapterDiagramsRow = chapterDiagrams && onToggleChapterDiagrams && codeReview?.on === true;
+  // Bro mode sits in the Experimental group (the owner, 2026-11-08), so the group shows for it alone too.
+  const broRow = bro && onToggleBro;
+  // Floating reply drafts (the owner, 2026-11-08): off by default, so its switch sits with the features still being tried.
+  const floatRow = floatDrafts && onToggleFloatDrafts;
+  const decisionRow = experimental && onToggleExperimental;
+  return (
+    <>
+      {(boardRow || stepsRow || scheduledRow || codeReviewRow || shapeRow) && (
+        <section className="ib-sgroup" data-settings-capabilities="" aria-label="Capabilities">
+          <div className="ib-card">
+            {boardRow && (
+              <div className="ib-prow" data-settings-board="">
+                <span className="ib-txt">
+                  <span className="ib-l" id="ib-board-label">
+                    Board
+                  </span>
+                  <span className="ib-desc">
+                    A page of the work in flight, one card per piece, that your agents keep current. Off, there is no Board page and agents are not offered cards; every card is kept. Agents pick this up in their next session.
+                  </span>
+                </span>
+                <span className="ib-ctl">
+                  <Switch on={board.on} labelledBy="ib-board-label" onClick={() => onToggleBoard(!board.on)} />
+                </span>
+              </div>
+            )}
+            {stepsRow && (
+              <div className="ib-prow" data-settings-steps="">
+                <span className="ib-txt">
+                  <span className="ib-l" id="ib-steps-label">
+                    Checklist
+                  </span>
+                  <span className="ib-desc">
+                    Your agents' plan for the work in a thread as a checklist, one step per line, under a button at the thread's foot. Off, agents are not offered a checklist and none shows; every checklist is kept. Agents pick this up in their next session.
+                  </span>
+                </span>
+                <span className="ib-ctl">
+                  <Switch on={steps.on} labelledBy="ib-steps-label" onClick={() => onToggleSteps(!steps.on)} />
+                </span>
+              </div>
+            )}
+            {scheduledRow && <ScheduledSettingsRow value={scheduled} onToggle={onToggleScheduled} />}
+            {codeReviewRow && (
+              <div className="ib-prow" data-settings-code-review="">
+                <span className="ib-txt">
+                  <span className="ib-l" id="ib-code-review-label">
+                    Code review
+                  </span>
+                  <span className="ib-desc">
+                    Review your agents' code changes and your pull requests from GitHub and GitLab: type / in a reply to ask for a review, then approve it, send feedback to the agent, or post it on the pull request. Off, agents are not offered reviews and the review skills leave the / list; guided reviews and <code>plannotator review</code> work as before either way. Agents pick this up in their next session.
+                  </span>
+                </span>
+                <span className="ib-ctl">
+                  <Switch on={codeReview.on} labelledBy="ib-code-review-label" onClick={() => onToggleCodeReview(!codeReview.on)} />
+                </span>
+              </div>
+            )}
+            {chapterDiagramsRow && (
+              <div className="ib-prow" data-settings-chapter-diagrams="">
+                <span className="ib-txt">
+                  <span className="ib-l" id="ib-chapter-diagrams-label">
+                    Chapter diagrams
+                  </span>
+                  <span className="ib-desc">Agents may add a diagram above a chapter's code.</span>
+                </span>
+                <span className="ib-ctl">
+                  <Switch on={chapterDiagrams.on} labelledBy="ib-chapter-diagrams-label" onClick={() => onToggleChapterDiagrams(!chapterDiagrams.on)} />
+                </span>
+              </div>
+            )}
+            {systemRow && (
+              <div className="ib-prow ib-sysrow" data-settings-system="">
+                <div className="ib-sysrow-top">
+                  <span className="ib-txt">
+                    <span className="ib-l" id="ib-system-label">
+                      System
+                    </span>
+                    <span className="ib-desc">A drawing of each project's system, kept current by an agent when main moves. Shows while Code review is on. Off, none of it shows; every drawing is kept. Yours alone.</span>
+                  </span>
+                  <span className="ib-ctl">
+                    <Switch on={system.on} labelledBy="ib-system-label" onClick={() => onToggleSystem(!system.on)} />
+                  </span>
+                </div>
+                {system.on && systemProjects && systemProjects.length > 0 && (
+                  <ul className="ib-sysrow-list" aria-label="Projects" data-settings-system-projects="">
+                    {systemProjects.map((project) => (
+                      <li key={project.id} className="ib-sysrow-p" data-settings-system-project={project.id}>
+                        <span className="ib-sysrow-n" dir="auto">
+                          {project.name}
+                        </span>
+                        <span className="ib-sysrow-s">{systemStateWords(project)}</span>
+                        {project.repo && (
+                          <button type="button" className="ib-btn" onClick={() => openSystemSetup(project.id)} aria-label={`Set up ${project.name}`} data-settings-system-setup={project.id}>
+                            Set up
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+            {shapeRow && (
+              <div className="ib-prow" data-settings-shape="">
+                <span className="ib-txt">
+                  <span className="ib-l" id="ib-shape-label">
+                    Shape
+                  </span>
+                  <span className="ib-desc">
+                    Boards your agents draw and keep current: a picture of the work you can point at to change or ask. Type /shape in a reply to ask for one; it opens from the thread's header. Off, agents are not offered boards and none shows; every board is kept.
+                  </span>
+                </span>
+                <span className="ib-ctl">
+                  <Switch on={shape.on} labelledBy="ib-shape-label" onClick={() => onToggleShape(!shape.on)} />
+                </span>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+      {(decisionRow || broRow || floatRow) && (
+        <section className="ib-sgroup" data-settings-experimental="" aria-labelledby="ib-g-experimental">
+          <h2 id="ib-g-experimental" ref={experimentalHeading} tabIndex={-1}>
+            Experimental
+          </h2>
+          <p>Features still being tried. Each stays off until you turn it on.</p>
+          <div className="ib-card">
+            {decisionRow && (
+              <div className="ib-prow" data-settings-decision-mode="">
+                <span className="ib-txt">
+                  <span className="ib-l" id="ib-decision-mode-label">
+                    Decision mode
+                  </span>
+                  <span className="ib-desc">
+                    {experimental.decision_mode.env !== null
+                      ? `PLANNOTATOR_EXPERIMENTAL turns it ${experimental.decision_mode.env ? 'on' : 'off'}.`
+                      : 'Answer what agents ask in a thread one decision at a time, from its open questions; each agent gets one reply.'}
+                  </span>
+                </span>
+                <span className="ib-ctl">
+                  <Switch
+                    on={experimental.decision_mode.on}
+                    labelledBy="ib-decision-mode-label"
+                    disabled={experimental.decision_mode.env !== null}
+                    onClick={() => onToggleExperimental(!experimental.decision_mode.on)}
+                  />
+                </span>
+              </div>
+            )}
+            {broRow && (
+              <div className="ib-prow" data-settings-bro="">
+                <span className="ib-txt">
+                  <span className="ib-l" id="ib-bro-label">
+                    Bro mode
+                  </span>
+                  <span className="ib-desc">
+                    Agents write to your Inbox in plain words. Applies to new agent sessions. In open Claude Code sessions, run <code>/reload-plugins plannotator</code>.
+                  </span>
+                </span>
+                <span className="ib-ctl">
+                  <Switch on={bro.on} labelledBy="ib-bro-label" onClick={() => onToggleBro(!bro.on)} />
+                </span>
+              </div>
+            )}
+            {floatRow && (
+              <div className="ib-prow" data-settings-float-drafts="">
+                <span className="ib-txt">
+                  <span className="ib-l" id="ib-float-drafts-label">
+                    Float reply drafts
+                  </span>
+                  <span className="ib-desc">Keep an unsent reply in a small window in the corner when you leave its thread.</span>
+                </span>
+                <span className="ib-ctl">
+                  <Switch on={floatDrafts.on} labelledBy="ib-float-drafts-label" onClick={() => onToggleFloatDrafts(!floatDrafts.on)} />
+                </span>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
+
+/**
+ * Agents (the approved "inbox-agent-awareness" design, 08-09): one group per
+ * agent found, with its reach, reminder and note (components/AgentsSettings.tsx).
+ * Until the agents are read (or on an Inbox that cannot list them), the
+ * tool switches and the harness picker as before.
+ */
+function AgentsSection({
+  settings,
+  context,
+  onToggleTool,
+  agents,
+  onAgents,
+}: {
+  settings: SettingsModel;
+  context: ConnectContext | null;
+  onToggleTool: (host: AgentToolHost, next: boolean) => void;
+  agents?: InboxAgentsModel | null;
+  onAgents?: (next: InboxAgentsModel) => void;
+}) {
+  if (agents && onAgents) {
+    return (
+      <>
+        <section className="ib-sgroup" aria-label="Agents">
+          <AgentsSettings model={agents} onModel={onAgents} context={context} launch={settings.launch ?? null} />
+        </section>
+      </>
+    );
+  }
+  const env = settings.inbox_tool.env;
+  return (
+    <>
+      <section className="ib-sgroup" aria-labelledby="ib-g-tool">
+        <h2 id="ib-g-tool">The Inbox in your agent&apos;s tools</h2>
+        <p>
+          Lets an agent send, read and wait for replies from its own tool list. Pi, OpenCode, DeepSeek Harness and Cline send every tool&apos;s definition with each request, so they start off. OpenClaw and
+          Hermes Agent start off too, until you turn them on here or <code>plannotator inbox</code> does.
+        </p>
+        {env !== null && (
+          <div className="ib-callout" data-tool-locked="">
+            <Icon name="lock" />
+            <span>PLANNOTATOR_INBOX_TOOL is set in this Inbox&apos;s environment, so every host is {env ? 'on' : 'off'}.</span>
+          </div>
+        )}
+        <div className="ib-card">
+          {TOOL_HOSTS.map(({ host, name }) => {
+            const on = settings.inbox_tool.hosts[host] ?? false;
+            return (
+              <div className="ib-prow" key={host}>
+                <HostMark host={host} big />
+                <span className="ib-txt">
+                  <span className="ib-l">{name}</span>
+                </span>
+                <span className="ib-ctl">
+                  <Switch on={on} label={`The Inbox tool in ${name}`} disabled={env !== null} onClick={() => onToggleTool(host, !on)} />
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        {env === null && (
+          <div className="ib-note">
+            <Icon name="info" />
+            Applies to the next session; for DeepSeek Harness, it applies when DeepSeek Harness next starts, and for OpenClaw from its next message. Sessions already running keep what they started with.
+          </div>
+        )}
+      </section>
+      <section className="ib-sgroup" aria-labelledby="ib-g-connect">
+        <h2 id="ib-g-connect">Connect an agent</h2>
+        <p>Agents on this computer reach the Inbox at 127.0.0.1, and it keeps its port between runs when it can.</p>
+        <div className="ib-card ib-card-pad">{context && <ConnectPicker harnesses={HARNESSES} initial="other" context={context} compact />}</div>
+      </section>
+    </>
+  );
+}
+
+/**
+ * Delete from Inbox, on a thread's row and on a project's (record 7.1; the words, approval
+ * "settings-storage-activity", 2026-11-08: "Delete project" read as deleting the project itself, while it only
+ * removes the project's messages and files from the Inbox). A first click asks "Delete? Click again" for a few
+ * seconds, a second one deletes. Nothing is undone once deleted, so one stray click never removes a project.
+ */
+const DELETE_LABEL = 'Delete from Inbox';
+
+function DeleteLink({ what, onDelete }: { what: string; onDelete: () => Promise<void> }) {
+  const [state, setState] = useState<'idle' | 'confirm' | 'busy'>('idle');
+  useEffect(() => {
+    if (state !== 'confirm') return;
+    const timer = setTimeout(() => setState('idle'), 4000);
+    return () => clearTimeout(timer);
+  }, [state]);
+  return (
+    <button
+      type="button"
+      className={`ib-del-l${state === 'confirm' ? ' ib-confirm' : ''}`}
+      disabled={state === 'busy'}
+      aria-label={state === 'confirm' ? `${DELETE_LABEL}: ${what} (click again to delete)` : `${DELETE_LABEL}: ${what}`}
+      onClick={() => {
+        if (state === 'idle') return setState('confirm');
+        if (state !== 'confirm') return;
+        setState('busy');
+        onDelete().finally(() => setState('idle'));
+      }}
+    >
+      {state === 'confirm' ? 'Delete? Click again' : DELETE_LABEL}
+    </button>
+  );
+}
+
+function StoreTable({
+  store,
+  onDeleteThread,
+  onDeleteProject,
+}: {
+  store: InboxStorageModel;
+  onDeleteThread: (threadId: string) => Promise<void>;
+  onDeleteProject: (projectId: string) => Promise<void>;
+}) {
+  const [open, setOpen] = useState<string | null>(store.projects[0]?.id ?? null);
+  const [showAll, setShowAll] = useState(false);
+  const shown = showAll ? store.projects : store.projects.slice(0, SHOWN_PROJECTS);
+  const rest = store.projects.slice(SHOWN_PROJECTS);
+  return (
+    <table className="ib-stbl">
+      <tbody>
+        {shown.map((project) => {
+          const isOpen = open === project.id;
+          return [
+            <tr key={project.id} data-store-project={project.name}>
+              <td>
+                <button type="button" className="ib-fold" onClick={() => setOpen(isOpen ? null : project.id)} aria-expanded={isOpen}>
+                  <Icon name={isOpen ? 'chevD' : 'chevR'} size={13} /> {project.name}
+                </button>
+                {/* Each folder keeps its own size and Delete: a project's Delete never reaches a combined project's threads. */}
+                {project.combined_into && <div className="ib-store-note">In {project.combined_into}</div>}
+                {project.combined && <div className="ib-store-note">Deleting it leaves {project.combined.join(', ')}, as {project.combined.length === 1 ? 'its own project' : 'their own projects'}</div>}
+              </td>
+              <td className="ib-n ib-n-threads">{plural(project.threads.length, 'thread')}</td>
+              <td className="ib-n">{formatBytes(project.bytes)}</td>
+              <td className="ib-a">
+                <DeleteLink what={project.name} onDelete={() => onDeleteProject(project.id)} />
+              </td>
+            </tr>,
+            ...(isOpen
+              ? project.threads.map((thread) => (
+                  <tr key={thread.thread_id} className="ib-sub" data-store-thread={thread.thread_id}>
+                    <td>{thread.subject ?? '(no subject)'}</td>
+                    <td className="ib-n ib-n-threads" />
+                    <td className="ib-n">{formatBytes(thread.bytes)}</td>
+                    <td className="ib-a">
+                      <DeleteLink what={thread.subject ?? 'this thread'} onDelete={() => onDeleteThread(thread.thread_id)} />
+                    </td>
+                  </tr>
+                ))
+              : []),
+          ];
+        })}
+        {!showAll && rest.length > 0 && (
+          <tr>
+            <td>
+              <button type="button" className="ib-fold" onClick={() => setShowAll(true)}>
+                <Icon name="chevR" size={13} /> {plural(rest.length, 'more project')}
+              </button>
+            </td>
+            <td className="ib-n ib-n-threads">{plural(rest.reduce((n, p) => n + p.threads.length, 0), 'thread')}</td>
+            <td className="ib-n">{formatBytes(rest.reduce((n, p) => n + p.bytes, 0))}</td>
+            <td className="ib-a" />
+          </tr>
+        )}
+      </tbody>
+    </table>
+  );
+}
+
+const LEDE: Record<SettingsSection, string> = {
+  general: 'How the Inbox looks, and how it gets your attention.',
+  // Rows draws its own lede, with Undo and Reset beside it (RowsSettings.tsx).
+  rows: '',
+  agents: "How each agent on this computer reaches the Inbox and learns when to use it. A change applies to that agent's next session; sessions already running keep what they started with.",
+  'cloud-agents': 'An agent in the cloud or on a server, such as a Claude Code routine, Grok Bot, Muse, Hermes Agent or OpenClaw, that reads and writes across this Inbox.',
+  accounts: '',
+  prompts: "What Plannotator tells your agents. A change applies to each agent's next session.",
+  devices: 'Your phone, and browsers on your other devices.',
+  machines: 'Your other computers with Plannotator. Each keeps its own Inbox; this one shows their threads too.',
+  voice: 'Speak a reply instead of typing it.',
+  archived: 'Threads you archived stay out of the list. Unarchive one to put it back and open it.',
+  storage: '',
+  about: 'The version, and how Plannotator keeps itself up to date.',
+  capabilities: 'What the Inbox does beyond your messages. Each switch turns a whole feature on or off.',
+  activity: 'Your threads hour by hour: one row per thread in the order they began, a mark for each hour with messages. Under it, the decisions you made.',
+};
+
+/**
+ * Settings (design of record `.product/approved/inbox-settings-tabs/`,
+ * Workspaces' SettingsFrame in the Inbox's scale): a focused page with
+ * "← Inbox" on top, a section nav (General, Agents, Prompts, Devices,
+ * Capabilities, Archived, Storage, About) and one
+ * section per page at `#settings/<section>`. On a phone, a list of the
+ * sections, then one
+ * section with "‹ Settings".
+ */
+export function SettingsPage(props: SettingsPageProps) {
+  const {
+    settings,
+    context,
+    error,
+    onToggleTool,
+    onToggleTailscale,
+    tailscaleBusy,
+    permission,
+    onToggleNotifications,
+    notifyReach,
+    onTestNotification,
+    onDeleteThread,
+    onDeleteProject,
+    about,
+    aboutDot,
+    sound,
+    archived,
+    archivedTotal,
+    pairing = false,
+    onSection,
+    onPairing,
+    onBack,
+    onRetry,
+    phone = false,
+  } = props;
+  const asked: SettingsSection | null = props.section ?? (phone ? null : 'general');
+  const cloud = useCloudAgentsGate(settings !== null, asked);
+  const section: SettingsSection | null = asked === 'cloud-agents' && cloud.shown === false ? 'agents' : asked;
+  // Settings → Storage's sizes walk every file on the server, so they are read only here, each time Storage is shown.
+  // The calm wait: nothing moves, and words show only when the count takes longer than STORE_SLOW_MS. Numbers that
+  // come after a wait fade in; numbers kept from an earlier visit are there at once.
+  const store = props.store ?? null;
+  const storageShown = section === 'storage';
+  const readStore = useRef(props.onReadStore);
+  readStore.current = props.onReadStore;
+  const [storeSlow, setStoreSlow] = useState(false);
+  const storeWaited = useRef(false);
+  if (!storageShown) {
+    storeWaited.current = false;
+    // Reset on leaving, not on the next open: an open would draw the last visit's words for a frame first.
+    if (storeSlow) setStoreSlow(false);
+  } else if (!store) storeWaited.current = true;
+  useEffect(() => {
+    if (!storageShown) return;
+    readStore.current?.();
+    const slow = setTimeout(() => setStoreSlow(true), STORE_SLOW_MS);
+    return () => clearTimeout(slow);
+  }, [storageShown]);
+  const storeFade = storeWaited.current ? 'ib-store-in' : undefined;
+  const phonesOn = settings?.phones === true;
+  const phones = usePhones(phonesOn);
+  const via = settings?.via ?? 'local';
+  const { mode } = useInboxTheme();
+  const palettes = useInboxPalettes();
+  const heading = useRef<HTMLHeadingElement>(null);
+  const firstSection = useRef(true);
+
+  // A new section takes focus to its heading, so a keyboard or screen reader starts at the top of it. Back to
+  // a phone's list of sections ("‹ Settings"), focus goes to the row of the section just left.
+  const lastSection = useRef<SettingsSection | null>(section);
+  const list = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const left = lastSection.current;
+    lastSection.current = section;
+    if (firstSection.current) {
+      firstSection.current = false;
+      // Opening Settings: the sidebar slides away with the button that opened it, so focus starts at the heading
+      // (approval "inbox-keyboard-shortcuts", focus fix 6), unless something on the page already has it.
+      const active = document.activeElement;
+      if (!phone && !active?.closest('.ib-spage')) heading.current?.focus({ preventScroll: true });
+      return;
+    }
+    if (section === null) {
+      if (left) list.current?.querySelector<HTMLElement>(`[data-settings-link="${left}"]`)?.focus();
+      return;
+    }
+    heading.current?.focus();
+  }, [section]);
+
+  // `#settings/experimental` (an old link): once the group is drawn (the settings may still be loading), bring it into
+  // view and focus its heading, after the section's own heading took focus above. The landing is kept until it
+  // happens, even if the route is read again meanwhile, and dropped when another section opens.
+  const experimentalHeading = useRef<HTMLHeadingElement | null>(null);
+  const landing = useRef(false);
+  const landAsked = useRef(false);
+  if (props.landOnExperimental && !landAsked.current) landing.current = true;
+  landAsked.current = props.landOnExperimental === true;
+  if (section !== 'capabilities') landing.current = false;
+  const experimentalShown =
+    section === 'capabilities' &&
+    ((!!settings?.experimental && !!props.onToggleExperimental) || (!!settings?.bro && !!props.onToggleBro) || (!!settings?.float_drafts && !!props.onToggleFloatDrafts));
+  useEffect(() => {
+    if (!landing.current || !experimentalShown || !experimentalHeading.current) return;
+    landing.current = false;
+    experimentalHeading.current.scrollIntoView?.({ block: 'start' });
+    experimentalHeading.current.focus({ preventScroll: true });
+  }, [props.landOnExperimental, experimentalShown]);
+
+  // Capabilities holds the Board and, below it, the Experimental group. Its row shows only while the Inbox has one
+  // of them (an older Inbox has neither, and an empty page is worse than no row); its address still opens.
+  const experimental = settings?.experimental && props.onToggleExperimental ? settings.experimental : null;
+  const board = settings?.board && props.onToggleBoard ? settings.board : null;
+  const steps = settings?.steps && props.onToggleSteps ? settings.steps : null;
+  const scheduled = settings?.scheduled_threads && props.onToggleScheduled ? settings.scheduled_threads : null;
+  const codeReview = settings?.code_review && props.onToggleCodeReview ? settings.code_review : null;
+  const shape = settings?.shape && props.onToggleShape ? settings.shape : null;
+  const system = settings?.system && props.onToggleSystem ? settings.system : null;
+  const chapterDiagrams = settings?.chapter_diagrams && props.onToggleChapterDiagrams ? settings.chapter_diagrams : null;
+  const bro = settings?.bro && props.onToggleBro ? settings.bro : null;
+  const floatDrafts = settings?.float_drafts && props.onToggleFloatDrafts ? settings.float_drafts : null;
+  // Machines shows while this Inbox can link one (its merged view names this machine); an older Inbox has no such page.
+  const machines = props.machines ?? [];
+  const linkedMachines = machines.filter((machine) => !machine.self);
+  const voice = useVoiceSettings();
+  const [look] = useListLook();
+  const sections = SETTINGS_SECTIONS.filter(
+    (id) => (id !== 'capabilities' || board !== null || steps !== null || scheduled !== null || codeReview !== null || shape !== null || bro !== null || floatDrafts !== null || experimental !== null) && (id !== 'cloud-agents' || cloud.shown === true) && (id !== 'machines' || machines.length > 0) && (id !== 'voice' || voice !== null),
+  );
+  /** The phone's list of sections, in its groups: settings (Capabilities last of them), then your data and Plannotator. */
+  const phoneGroups: { label: string; ids: SettingsSection[] }[] = [
+    { label: 'Settings', ids: sections.filter((id) => SETTINGS_SECTIONS.indexOf(id) <= SETTINGS_SECTIONS.indexOf('capabilities')) },
+    { label: 'Your data and Plannotator', ids: sections.filter((id) => id === 'activity' || id === 'archived' || id === 'storage' || id === 'about') },
+  ].filter((group) => group.ids.length > 0);
+
+  const devicesDot = devicesNeedAttention(phonesOn ? phones : null, settings?.tailscale);
+  const loadFailed = !settings && error !== null;
+
+  const go = (next: SettingsSection | null) => (event: MouseEvent) => {
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    event.preventDefault();
+    onSection?.(next);
+  };
+
+  const badge = (id: SettingsSection): ReactNode => {
+    if (id === 'archived' && archivedTotal) return <span className="ib-scount">{formatCount(archivedTotal)}</span>;
+    if (id === 'about' && aboutDot)
+      return <span className="ib-dot" aria-label={aboutDot === 'check-failing' ? 'Checking for updates is failing' : 'A new version is available'} role="img" />;
+    if (id === 'devices' && devicesDot) return <span className="ib-dot ib-warn" aria-label="Something here is not working" role="img" />;
+    if (id === 'machines' && linkedMachines.some((machine) => machine.state === 'needs_update' || machine.state === 'revoked'))
+      return <span className="ib-dot ib-warn" aria-label="A machine needs attention" role="img" data-machines-dot="" />;
+    if (id === 'agents' && agentsNeedRestart(props.agents)) return <span className="ib-dot ib-warn" aria-label="Sessions need a reload" role="img" data-agents-dot="" />;
+    return null;
+  };
+
+  /** The phone list's value beside each section. */
+  const value = (id: SettingsSection): string => {
+    if (!settings) return '';
+    switch (id) {
+      case 'general': {
+        const modeLabel = mode === 'system' ? 'Match system' : mode === 'light' ? 'Light' : 'Dark';
+        // The palette on screen, unless both halves are still the default one.
+        const shownPalette = palettes.pair[palettes.shown];
+        const defaults = palettes.pair.light === DEFAULT_COLOR_THEME && palettes.pair.dark === DEFAULT_COLOR_THEME;
+        return defaults ? modeLabel : `${modeLabel} · ${palettes.nameOf(shownPalette)}`;
+      }
+      case 'agents': {
+        if (props.agents) {
+          const connected = props.agents.agents.filter((row) => row.detected && row.reach.on).map((row) => row.label);
+          return connected.length === 0 ? 'None' : connected.length === 1 ? connected[0]! : `${connected.length} agents`;
+        }
+        const on = TOOL_HOSTS.filter(({ host }) => settings.inbox_tool.hosts[host]).map(({ name }) => name);
+        return on.length === 0 ? 'Off' : on.length === 1 ? on[0]! : `${on.length} agents`;
+      }
+      case 'cloud-agents':
+        return cloud.count > 0 ? plural(cloud.count, 'agent') : '';
+      case 'rows':
+        return rowsSummary(look);
+      case 'accounts':
+        return '';
+      case 'prompts':
+        return settings.prompts ? promptsSummary(settings.prompts) : '';
+      case 'devices':
+        if (phonesOn && phones.devices && phones.devices.length > 0) return plural(phones.devices.length, 'phone');
+        return settings.tailscale?.on ? 'Over your tailnet' : '';
+      case 'machines':
+        return linkedMachines.length > 0 ? plural(linkedMachines.length, 'machine') : '';
+      case 'archived':
+        return archivedTotal ? formatCount(archivedTotal) : '';
+      case 'storage':
+        // Only once Storage was opened this visit: the list never asks for the walk.
+        return store ? formatBytes(store.bytes) : '';
+      case 'activity':
+        return '';
+      case 'about':
+        return settings.version;
+      case 'voice':
+        return !voice?.on ? 'Off' : voice.engine === 'api' ? 'API key' : 'Codex login';
+      case 'capabilities': {
+        // What is on, by name: "Off", "Board", "Decision mode", or "2 on".
+        const on = [board?.on ? 'Board' : null, steps?.on ? 'Checklist' : null, codeReview?.on ? 'Code review' : null, experimental?.decision_mode.on ? 'Decision mode' : null].filter((name): name is string => name !== null);
+        return on.length === 0 ? 'Off' : on.length === 1 ? on[0]! : `${on.length} on`;
+      }
+    }
+  };
+
+  let body: ReactNode = null;
+  if (section && settings) {
+    switch (section) {
+      case 'general':
+        body = (
+          <GeneralSection
+            settings={settings}
+            permission={permission}
+            onToggleNotifications={onToggleNotifications}
+            notifyReach={notifyReach}
+            onTestNotification={onTestNotification}
+            sound={sound}
+            onToggleCookieHost={props.onToggleCookieHost}
+            onTakeTour={props.onTakeTour}
+            updateRow={props.updateRow}
+            onToggleMarkReadWarning={props.onToggleMarkReadWarning}
+          />
+        );
+        break;
+      case 'rows':
+        body = <RowsSection phone={phone} onGeneral={() => onSection?.('general')} {...props.rowsPreview} />;
+        break;
+      case 'agents':
+        body = <AgentsSection settings={settings} context={context} onToggleTool={onToggleTool} agents={props.agents} onAgents={props.onAgents} />;
+        break;
+      case 'cloud-agents':
+        body = <CloudAgentsSection />;
+        break;
+      case 'accounts':
+        body = (
+          <>
+            <AccountsSection machine={machines.find((machine) => machine.self)?.name} />
+            {settings.linear_key && <LinearKeySettings initial={settings.linear_key} where={voiceWhere(settings.voice ?? null)} />}
+          </>
+        );
+        break;
+      case 'prompts':
+        body = settings.prompts ? (
+          <PromptsSection prompts={settings.prompts} onPrompts={props.onPrompts} configFile={`${settings.data_dir}/config.json`} home={settings.home} />
+        ) : (
+          <div className="ib-card ib-sempty">
+            <Icon name="prompt" />
+            This Inbox is older than Settings → Prompts. Restart it to update.
+          </div>
+        );
+        break;
+      case 'devices':
+        body = (
+          <DevicesSection
+            phones={phonesOn ? phones : null}
+            tailscale={settings.tailscale}
+            via={via}
+            tailscaleBusy={tailscaleBusy}
+            onToggleTailscale={onToggleTailscale}
+            pairing={pairing && phonesOn}
+            onPairing={(open) => onPairing?.(open)}
+          />
+        );
+        break;
+      case 'machines':
+        body = <MachinesSection machines={machines} onChanged={() => props.onMachinesChanged?.()} onMachineUpdate={props.onMachineUpdate} />;
+        break;
+      case 'archived':
+        body = archived ?? (
+          <div className="ib-card ib-sempty">
+            <Icon name="archive" />
+            Archived threads are listed here.
+          </div>
+        );
+        break;
+      case 'storage':
+        body = (
+          <section className="ib-sgroup" aria-labelledby="ib-g-store">
+            <h2 id="ib-g-store">By project</h2>
+            <p>Deleting removes a thread or project's messages and files from the Inbox. Your code is never touched. Delete asks twice and can't be undone.</p>
+            {!store ? (
+              <div className="ib-card ib-store-wait" data-store-wait="" aria-busy={props.storeError ? undefined : true}>
+                {props.storeError ? (
+                  <span className="ib-store-wait-t" role="alert" data-store-error="">
+                    The sizes could not be read. {props.storeError}{' '}
+                    <button type="button" className="ib-lnk" onClick={() => props.onReadStore?.()}>
+                      Try again
+                    </button>
+                  </span>
+                ) : (
+                  storeSlow && <span className="ib-store-wait-t">Counting what is stored…</span>
+                )}
+              </div>
+            ) : store.projects.length > 0 ? (
+              <div className={storeFade ? `ib-card ${storeFade}` : 'ib-card'}>
+                <StoreTable store={store} onDeleteThread={onDeleteThread} onDeleteProject={onDeleteProject} />
+              </div>
+            ) : (
+              <div className={storeFade ? `ib-card ib-sempty ${storeFade}` : 'ib-card ib-sempty'}>
+                <Icon name="disk" />
+                Nothing stored yet.
+              </div>
+            )}
+          </section>
+        );
+        break;
+      case 'activity':
+        // The chart on top, the decision numbers under it (approval "settings-storage-activity"). DecisionData asks
+        // the server to count when it mounts, so only this section, while shown, ever asks.
+        body = (
+          <>
+            {props.activity}
+            <DecisionData />
+          </>
+        );
+        break;
+      case 'about':
+        body = about;
+        break;
+      case 'voice':
+        body = <VoiceSettings />;
+        break;
+      case 'capabilities':
+        body =
+          (board && props.onToggleBoard) || steps || scheduled || codeReview || shape || bro || experimental ? (
+            <CapabilitiesSection
+              board={board}
+              onToggleBoard={props.onToggleBoard}
+              steps={steps}
+              onToggleSteps={props.onToggleSteps}
+              scheduled={scheduled}
+              onToggleScheduled={props.onToggleScheduled}
+              codeReview={codeReview}
+              onToggleCodeReview={props.onToggleCodeReview}
+              shape={shape}
+              onToggleShape={props.onToggleShape}
+              system={system}
+              onToggleSystem={props.onToggleSystem}
+              systemProjects={props.systemProjects}
+              chapterDiagrams={chapterDiagrams}
+              onToggleChapterDiagrams={props.onToggleChapterDiagrams}
+              bro={bro}
+              onToggleBro={props.onToggleBro}
+              floatDrafts={floatDrafts}
+              onToggleFloatDrafts={props.onToggleFloatDrafts}
+              experimental={experimental}
+              onToggleExperimental={props.onToggleExperimental}
+              experimentalHeading={experimentalHeading}
+            />
+          ) : (
+            <div className="ib-card ib-sempty" data-settings-capabilities-none="">
+              <Icon name="puzzle" />
+              This Inbox is older than Settings → Capabilities. Restart it to update.
+            </div>
+          );
+        break;
+    }
+  }
+
+  const lede =
+    section === 'storage' && settings ? (
+      <p className="ib-lede">
+        {store ? (
+          <b data-store-bytes={store.bytes} className={storeFade}>
+            {formatBytes(store.bytes)}
+          </b>
+        ) : (
+          <span className="ib-store-bar" data-store-bar="" aria-hidden="true" />
+        )}{' '}
+        in {tildePath(store?.dir ?? settings.store_dir ?? settings.store?.dir ?? '', settings.home)}: messages, attached files as they were sent, and annotations.
+      </p>
+    ) : section === 'devices' && settings && !phonesOn ? (
+      <p className="ib-lede">Open this Inbox from your phone, tablet or another computer.</p>
+    ) : section && LEDE[section] ? (
+      <p className="ib-lede">{LEDE[section]}</p>
+    ) : null;
+
+  const page =
+    phone && section === null ? (
+      <div className="ib-plist" data-settings-list="" ref={list}>
+        <div className="ib-plist-h">
+          <SidebarTrigger />
+          <h1>Settings</h1>
+        </div>
+        {phoneGroups.map((group) => (
+          <ul className="ib-card" key={group.label} aria-label={group.label}>
+            {group.ids.map((id) => (
+              <li key={id}>
+                <a href={`#${settingsHash({ section: id })}`} onClick={go(id)} data-settings-link={id}>
+                  <span className="ib-tile">
+                    <Icon name={SECTION_ICON[id]} />
+                  </span>
+                  {SETTINGS_SECTION_LABEL[id]}
+                  <span className="ib-v">{value(id)}</span>
+                  {/* The archived count is the row's value here; only the dots add to it. */}
+                  {id !== 'archived' && badge(id)}
+                  <Icon name="chevR" size={15} className="ib-chev" />
+                </a>
+              </li>
+            ))}
+          </ul>
+        ))}
+        {loadFailed && <LoadError error={error} onRetry={onRetry} />}
+      </div>
+    ) : (
+      <div className="ib-spg" data-settings-section={section ?? 'general'}>
+        {phone && (
+          <div className="ib-sphead">
+            <a href="#settings" className="ib-pback" onClick={go(null)}>
+              <Icon name="chevL" /> Settings
+            </a>
+          </div>
+        )}
+        {section === 'cloud-agents' && settings ? (
+          <div className="ib-spg-h">
+            <h1 ref={heading} tabIndex={-1}>
+              {SETTINGS_SECTION_LABEL[section]}
+            </h1>
+            <CloudHowButton />
+          </div>
+        ) : section === 'accounts' && settings ? (
+          // Accounts' Refresh reads every machine, so it sits by the page's title (approval "accounts-page").
+          <div className="ib-spg-h">
+            <h1 ref={heading} tabIndex={-1}>
+              {SETTINGS_SECTION_LABEL[section]}
+            </h1>
+            <AccountsRefresh />
+          </div>
+        ) : (
+          <h1 ref={heading} tabIndex={-1}>
+            {section ? SETTINGS_SECTION_LABEL[section] : 'General'}
+          </h1>
+        )}
+        {loadFailed ? (
+          <>
+            <LoadError error={error} onRetry={onRetry} />
+            <div className="ib-skel" aria-hidden="true" />
+            <div className="ib-skel" aria-hidden="true" />
+          </>
+        ) : !settings ? (
+          <>
+            <div className="ib-skel" aria-hidden="true" />
+            <div className="ib-skel" aria-hidden="true" />
+          </>
+        ) : (
+          <>
+            {lede}
+            {error && settings && (
+              <div className="ib-callout ib-err" role="alert" data-settings-error="">
+                <Icon name="xCircle" />
+                <span>{error}</span>
+              </div>
+            )}
+            {body}
+          </>
+        )}
+      </div>
+    );
+
+  return (
+    <div className="ib-spage ib-sframe" aria-label="Settings">
+      <div className="ib-sframe-in">
+        {!phone && (
+          <button type="button" className="ib-sback" onClick={onBack} data-settings-back="">
+            <Icon name="back" size={15} /> Inbox
+          </button>
+        )}
+        <div className="ib-scols">
+          {!phone && (
+            <nav className="ib-snav" aria-label="Settings sections">
+              <div className="ib-eyebrow" aria-hidden="true">
+                Settings
+              </div>
+              <ul>
+                {sections.map((id) => (
+                  <li key={id}>
+                    <a href={`#${settingsHash({ section: id })}`} aria-current={id === section ? 'page' : undefined} onClick={go(id)} data-settings-link={id}>
+                      <Icon name={SECTION_ICON[id]} />
+                      {SETTINGS_SECTION_LABEL[id]}
+                      {badge(id)}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </nav>
+          )}
+          {page}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LoadError({ error, onRetry }: { error: string | null; onRetry?: () => void }) {
+  return (
+    <div className="ib-callout ib-err" role="alert" data-settings-load-error="">
+      <Icon name="xCircle" />
+      <span>
+        <b>Settings did not load.</b> {error} It may have stopped: run <code>plannotator inbox</code>, then{' '}
+        <button type="button" className="ib-lnk" onClick={onRetry}>
+          Try again
+        </button>
+        .
+      </span>
+    </div>
+  );
+}

@@ -1,0 +1,313 @@
+import React, { useEffect, useLayoutEffect, useState } from 'react';
+import type { DiffFileStatus } from '../types';
+import type { ReviewImageData, ReviewImageSide } from '../utils/reviewImage';
+import { ALL_FILES_IMAGE_MAX_HEIGHT, LABELS_OVER_MIN_HEIGHT, LABELS_OVER_MIN_WIDTH, SIDE_BY_SIDE_GAP, SIDE_BY_SIDE_MIN_WIDTH, sideBySideColumns, sideBySidePaneWidth, stageLayout, type Size } from './image-diff/geometry';
+import { useImageDiffSettings } from './image-diff/imageDiffSettings';
+import { sidesFor, useImageSides, useNearViewport } from './image-diff/useImageSides';
+import { SinglePane, StackedStage, StageLabelRow, type StageImage } from './image-diff/ImageStage';
+import { peekImageSizes } from './image-diff/imageSizes';
+import { computeDifferences, differencesSupported, type DifferenceMask } from './image-diff/differences';
+import { describeImageError, imageCaption, sizeChange } from './image-diff/imageWords';
+
+
+export interface ImageDiffPreviewProps {
+  filePath: string;
+  status: DiffFileStatus;
+  snapshotId?: string;
+  variant: 'single' | 'all-files';
+  compact?: boolean;
+  fallback: React.ReactNode;
+  tooLargeFallback?: React.ReactNode;
+  onHeightChange?: () => void;
+  patch?: string;
+}
+
+
+function useWidth(ref: React.RefObject<HTMLDivElement | null>): number {
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const read = () => setWidth(el.clientWidth);
+    read();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(read);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref]);
+  return width;
+}
+
+function useAccentColor(): string {
+  const [color, setColor] = useState('rgb(59 130 246)');
+  useEffect(() => {
+    const value = getComputedStyle(document.documentElement).getPropertyValue('--primary').trim();
+    if (value) setColor(value);
+  }, []);
+  return color;
+}
+
+export const ImageDiffPreview: React.FC<ImageDiffPreviewProps> = ({
+  filePath,
+  status,
+  snapshotId,
+  variant,
+  compact = false,
+  fallback,
+  tooLargeFallback,
+  onHeightChange,
+  patch,
+}) => {
+  const sides = sidesFor(status);
+  const [rootRef, visible] = useNearViewport();
+  const knownEntry = peekImageSizes(snapshotId)?.[filePath];
+  const { states, markDecodeError } = useImageSides({
+    snapshotId,
+    filePath,
+    status,
+    visible,
+    patch,
+    knownBytes: { old: knownEntry?.old?.bytes, new: knownEntry?.new?.bytes },
+  });
+  const [natural, setNatural] = useState<Partial<Record<ReviewImageSide, Size>>>({});
+  const settings = useImageDiffSettings();
+  const [position, setPosition] = useState(0.5);
+  const [opacity, setOpacity] = useState(0.5);
+  const [scroll, setScroll] = useState<{ left: number; top: number } | null>(null);
+  const [mask, setMask] = useState<DifferenceMask | null>(null);
+  const accent = useAccentColor();
+  const contentRef = React.useRef<HTMLDivElement>(null);
+  const width = useWidth(contentRef);
+
+  const loaded = sides.flatMap((side) => (states[side].state === 'ok' ? [{ side, image: (states[side] as { image: ReviewImageData }).image }] : []));
+  const errors = sides.flatMap((side) => (states[side].state === 'error' ? [{ side, error: (states[side] as { error: { reason: string; status: number } }).error }] : []));
+  const before = loaded.find((s) => s.side === 'old')?.image;
+  const after = loaded.find((s) => s.side === 'new')?.image;
+  const known = peekImageSizes(snapshotId)?.[filePath];
+  const knownSize = (side: ReviewImageSide): Size | null => {
+    const entry = known?.[side];
+    return entry?.width && entry?.height ? { width: entry.width, height: entry.height } : null;
+  };
+  const sizeOf = (side: ReviewImageSide, image?: ReviewImageData): Size | null =>
+    image?.width && image?.height ? { width: image.width, height: image.height } : natural[side] ?? knownSize(side);
+  const bytesOf = (side: ReviewImageSide, image?: ReviewImageData): number | undefined => image?.bytes ?? known?.[side]?.bytes;
+  const beforeSize = sizeOf('old', before);
+  const afterSize = sizeOf('new', after);
+  const beforeBytes = bytesOf('old', before);
+  const afterBytes = bytesOf('new', after);
+  const unchanged = sides.length === 2 && !!before && !!after && before.digest === after.digest;
+  const comparable = sides.length === 2 && !unchanged && !!beforeSize && !!afterSize && states.old.state !== 'error' && states.new.state !== 'error';
+  const mode = comparable ? settings.mode : 'side';
+  const maxHeight = variant === 'all-files' ? ALL_FILES_IMAGE_MAX_HEIGHT : 640;
+  const narrow = width > 0 && width < SIDE_BY_SIDE_MIN_WIDTH;
+  const canvasNatural = { width: Math.max(beforeSize?.width ?? 0, afterSize?.width ?? 0), height: Math.max(beforeSize?.height ?? 0, afterSize?.height ?? 0) };
+  const columnsFit = comparable && sideBySideColumns(canvasNatural, width);
+  const twoColumns = columnsFit && mode === 'side';
+  const paneWidth = sideBySidePaneWidth(width, columnsFit);
+  const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+  const sized = comparable || !!(beforeSize ?? afterSize);
+  const layout = sized && width > 0
+    ? stageLayout({
+        old: unchanged ? null : beforeSize,
+        new: afterSize ?? (unchanged ? beforeSize : null),
+        available: { width: paneWidth, height: maxHeight },
+        zoom: settings.zoom,
+        dpr,
+      })
+    : null;
+  const dimensionsDiffer = comparable && !!beforeSize && !!afterSize && (beforeSize.width !== afterSize.width || beforeSize.height !== afterSize.height);
+
+  const wantDifferences = comparable && settings.differences && differencesSupported() && !!beforeSize && !!afterSize;
+  const diffKey = `${snapshotId ?? ''}|${filePath}|${before?.digest ?? ''}|${after?.digest ?? ''}`;
+  useEffect(() => {
+    if (!wantDifferences || !before || !after || !beforeSize || !afterSize) {
+      setMask(null);
+      return;
+    }
+    let live = true;
+    computeDifferences(diffKey, { url: before.url, size: beforeSize }, { url: after.url, size: afterSize }).then((result) => {
+      if (live) setMask(result);
+    });
+    return () => {
+      live = false;
+    };
+  }, [wantDifferences, diffKey]);
+
+  let shown: 'preview' | 'fallback' | 'too-large' = snapshotId ? 'preview' : 'fallback';
+  if (shown === 'preview' && errors.length === sides.length) {
+    if (errors.every((e) => e.error.reason === 'not-image')) shown = 'fallback';
+    else if (tooLargeFallback && errors.every((e) => e.error.reason === 'too-large' && !(e.error as { width?: number }).width)) shown = 'too-large';
+  }
+
+  const heightChangeRef = React.useRef(onHeightChange);
+  heightChangeRef.current = onHeightChange;
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!el || !heightChangeRef.current) return;
+    let last = -1;
+    const report = () => {
+      const next = el.getBoundingClientRect().height;
+      if (next !== last) {
+        last = next;
+        heightChangeRef.current?.();
+      }
+    };
+    report();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(report);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [rootRef, shown]);
+
+  const stageImage = (side: ReviewImageSide, image: ReviewImageData, label: string): StageImage => ({
+    url: image.url,
+    alt: `${label}: ${filePath}`,
+    size: (side === 'old' ? layout?.old : layout?.new) ?? layout?.stage ?? { width: 0, height: 0 },
+    onNatural: image.width && image.height ? undefined : (size) => setNatural((prev) => (prev[side]?.width === size.width && prev[side]?.height === size.height ? prev : { ...prev, [side]: size })),
+    onError: () => markDecodeError(side),
+  });
+
+  if (shown === 'fallback') return <>{fallback}</>;
+  if (shown === 'too-large') return <>{tooLargeFallback}</>;
+
+  const sideLabel = (side: ReviewImageSide) => (unchanged ? 'Image' : status === 'added' ? 'Added' : status === 'deleted' ? 'Deleted' : side === 'old' ? 'Before' : 'After');
+  const reserve = layout ? undefined : { height: Math.min(maxHeight, 160) };
+
+  const pane = (side: ReviewImageSide) => {
+    const state = states[side];
+    const image = state.state === 'ok' ? state.image : undefined;
+    const label = sideLabel(side);
+    return (
+      <figure key={side} className="m-0 min-w-0" data-image-side={side}>
+        {image && layout ? (
+          <SinglePane
+            image={stageImage(side, image, label)}
+            side={side}
+            layout={layout}
+            box={(side === 'old' ? layout.old : layout.new) ?? layout.stage}
+            maxHeight={maxHeight}
+            mask={side === 'new' ? mask : null}
+            maskColor={accent}
+            label={label}
+            labelAbove={labelsAboveImage}
+            onScrollPosition={twoColumns ? (left, top) => setScroll({ left, top }) : undefined}
+            scrollTo={twoColumns ? scroll : null}
+          />
+        ) : image ? (
+          <img
+            src={image.url}
+            alt={`${label}: ${filePath}`}
+            draggable={false}
+            data-image-layer={side}
+            className="block max-h-40 max-w-full"
+            onLoad={(event) => {
+              const el = event.currentTarget;
+              setNatural((prev) => (prev[side] ? prev : { ...prev, [side]: { width: el.naturalWidth || 300, height: el.naturalHeight || 150 } }));
+            }}
+            onError={() => markDecodeError(side)}
+          />
+        ) : layout && state.state === 'loading' ? (
+          <>
+          {labelsAboveImage && <StageLabelRow left={label} />}
+          <div
+            className="animate-pulse rounded-sm bg-muted/50 motion-reduce:animate-none"
+            style={{ width: ((side === 'old' ? layout.old : layout.new) ?? layout.stage).width, height: Math.min(layout.stage.height, maxHeight), marginLeft: layout.offsetX }}
+            aria-label="Loading image"
+            data-image-reserved=""
+          />
+          </>
+        ) : state.state === 'error' ? (
+          <p className="py-6 text-xs text-muted-foreground" data-image-error={state.error.reason}>
+            {label}: {describeImageError(state.error)}
+          </p>
+        ) : (
+          <div className="animate-pulse rounded-sm bg-muted/50 motion-reduce:animate-none" style={reserve ?? { height: Math.min(maxHeight, 160) }} aria-label="Loading image" />
+        )}
+        <figcaption className="mt-1 text-xs leading-5 text-muted-foreground tabular-nums" data-image-unchanged={unchanged ? '' : undefined}>
+          <span className="whitespace-nowrap">{bytesOf(side, image) !== undefined ? imageCaption(null, sizeOf(side, image), bytesOf(side, image)!) : label}</span>
+          {side === 'new' && comparable && beforeBytes !== undefined && afterBytes !== undefined && (
+            <span data-image-delta="" className="ml-1 whitespace-nowrap">{sizeChange(beforeSize, afterSize, beforeBytes, afterBytes)}</span>
+          )}
+          {unchanged && <span className="ml-1 whitespace-nowrap">· contents unchanged</span>}
+          {image && side === 'new' && differencesText && <span className="ml-1 whitespace-nowrap">· {differencesText}</span>}
+        </figcaption>
+      </figure>
+    );
+  };
+
+  const labelsAboveImage = narrow || !layout || layout.stage.width < LABELS_OVER_MIN_WIDTH || Math.min(layout.stage.height, maxHeight) < LABELS_OVER_MIN_HEIGHT;
+  const differencesText = mask && comparable
+    ? `${((mask.changed / mask.total) * 100).toFixed(mask.changed / mask.total < 0.01 ? 2 : 1)}% of pixels differ`
+    : null;
+  const stackedMode = comparable && (mode === 'swipe' || mode === 'onion') && !!layout;
+  const stacked = stackedMode && before && after;
+
+  return (
+    <div ref={rootRef} data-image-diff-preview="" data-image-diff-mode={comparable ? mode : 'single'} className="relative border-b border-border px-4 py-3">
+      <div ref={contentRef} className="min-w-0">
+        {stackedMode && !stacked ? (
+          <>
+            {mode === 'swipe' && labelsAboveImage && <StageLabelRow left="Before" right="After" width={layout!.stage.width} />}
+            <div
+              className="animate-pulse rounded-sm bg-muted/50 motion-reduce:animate-none"
+              style={{ width: layout!.stage.width, height: Math.min(layout!.stage.height, maxHeight) }}
+              aria-label="Loading image"
+              data-image-reserved=""
+            />
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 text-xs leading-5 text-muted-foreground tabular-nums">
+              <span className="whitespace-nowrap">Before {beforeBytes !== undefined ? imageCaption(null, beforeSize, beforeBytes) : ''}</span>
+            </div>
+          </>
+        ) : stacked ? (
+          <>
+            <StackedStage
+              mode={mode as 'swipe' | 'onion'}
+              before={stageImage('old', before!, 'Before')}
+              after={stageImage('new', after!, 'After')}
+              layout={layout!}
+              maxHeight={maxHeight}
+              position={position}
+              onPosition={setPosition}
+              opacity={opacity}
+              mask={mask}
+              maskColor={accent}
+              labelsAbove={labelsAboveImage}
+            />
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 text-xs leading-5 text-muted-foreground tabular-nums" data-image-meta="">
+              <span className="whitespace-nowrap">Before {imageCaption(null, beforeSize, before!.bytes)}</span>
+              {mode === 'onion' ? (
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={Math.round(opacity * 100)}
+                  onChange={(event) => setOpacity(Number(event.target.value) / 100)}
+                  aria-label="After opacity"
+                  data-onion-opacity=""
+                  className="h-1 w-28 accent-[var(--primary)]"
+                />
+              ) : (
+                <span aria-hidden="true">→</span>
+              )}
+              <span className="whitespace-nowrap">After {imageCaption(null, afterSize, after!.bytes)}</span>
+              <span data-image-delta="" className="whitespace-nowrap">{sizeChange(beforeSize, afterSize, before!.bytes, after!.bytes)}</span>
+              {dimensionsDiffer && (
+                <span data-image-sizes-differ="" title="Both images are aligned top left at one scale; neither is stretched" className="rounded border border-border px-1 leading-4">
+                  sizes differ
+                </span>
+              )}
+              {differencesText && <span className="whitespace-nowrap">· {differencesText}</span>}
+            </div>
+          </>
+        ) : (
+          <div
+            className="grid"
+            style={{ gridTemplateColumns: twoColumns ? `${paneWidth}px ${paneWidth}px` : 'minmax(0, 1fr)', columnGap: SIDE_BY_SIDE_GAP, rowGap: 12 }}
+          >
+            {(unchanged ? (['new'] as ReviewImageSide[]) : sides).map(pane)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};

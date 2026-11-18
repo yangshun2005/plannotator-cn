@@ -1,0 +1,73 @@
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { privateWrite, type T3Credentials } from "./auth";
+import { T3Thread, type T3SentMessage } from "./t3-client";
+
+interface Delivery {
+  thread: string;
+  requestId: string;
+  text: string;
+  epoch: string;
+  receipt?: T3SentMessage;
+  /** T3 denied it for the grant's mode: no turn was made, so a later grant sends it as new. */
+  denied?: true;
+}
+
+/** A delivery that retrying can never complete; it needs a person to look. */
+export class T3DeliveryRefused extends Error {}
+
+export class T3Delivery {
+  readonly directory: string;
+  constructor(readonly thread: T3Thread, readonly credentials: T3Credentials) {
+    this.directory = join(credentials.directory, "deliveries", createHash("sha256").update(thread.id).digest("hex"));
+    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+  }
+
+  /**
+   * Send once, idempotently. The grant ("epoch") is read at each send, so a
+   * new `plannotator t3 login` applies without restarting the worker; only a
+   * send that was already attempted under an older grant is refused, because
+   * T3's retry namespace changed with the grant.
+   */
+  async send(text: string, requestId: string): Promise<T3SentMessage> {
+    const epoch = this.credentials.read()?.epoch;
+    if (!epoch) throw new Error("Sign in to T3 before sending.");
+    const path = this.pathOf(requestId);
+    const previous = this.recorded(requestId);
+    if (previous && (previous.thread !== this.thread.id || previous.requestId !== requestId || previous.text !== text)) throw new T3DeliveryRefused("A T3 delivery retry changed its scope or content.");
+    if (previous?.receipt) return previous.receipt;
+    // A new OAuth grant changes T3's retry namespace. Never replay an uncertain send under it.
+    if (previous && previous.epoch !== epoch && !previous.denied) throw new T3DeliveryRefused("This delivery is uncertain after T3 reauthorization. Check the T3 thread before retrying it.");
+    const delivery: Delivery = { thread: this.thread.id, requestId, text, epoch };
+    privateWrite(path, delivery);
+    const receipt = await this.thread.send(text, requestId);
+    privateWrite(path, { ...delivery, receipt });
+    return receipt;
+  }
+
+  /**
+   * Like `send`, but a retry re-sends the text recorded on the first try:
+   * for words that can drift between tries (an Inbox wake names the thread as
+   * it is now), so the request stays one T3 turn.
+   */
+  sendFirst(text: string, requestId: string): Promise<T3SentMessage> {
+    return this.send(this.recorded(requestId)?.text ?? text, requestId);
+  }
+
+  /** T3 denied this request for the grant's mode (`capability_denied`, a mode escalation): it took nothing. */
+  denied(requestId: string): void {
+    const previous = this.recorded(requestId);
+    if (previous && !previous.receipt) privateWrite(this.pathOf(requestId), { ...previous, denied: true });
+  }
+
+  private pathOf(requestId: string): string {
+    return join(this.directory, `${createHash("sha256").update(requestId).digest("hex")}.json`);
+  }
+
+  private recorded(requestId: string): Delivery | undefined {
+    const path = this.pathOf(requestId);
+    return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as Delivery : undefined;
+  }
+
+}

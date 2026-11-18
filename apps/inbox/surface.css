@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+@plugin "tailwindcss-animate";
+
+/* Tell Tailwind where to scan for classes: Plannotator's viewers and the
+   guide chain the surface mounts. No webfonts: the surface draws in the
+   system face. */
+@source "../../packages/ui/components/**/*.tsx";
+@source "../../packages/ui/hooks/**/*.ts";
+/* The shared chat window has no host in this app, so its classes stay out of this stylesheet. */
+@source not "../../packages/ui/components/chat/**";
+@source not "../../packages/ui/components/frame/**";
+@source "../../packages/inbox/surface/**/*.tsx";
+@source "../../packages/inbox/guide/**/*.tsx";
+@source "../../packages/guide-viewer/**/*.tsx";
+@source "../../packages/review-editor/components/**/*.tsx";
+
+@import "../../packages/ui/theme.css";
+@import "../../packages/inbox/surface/surface.css";

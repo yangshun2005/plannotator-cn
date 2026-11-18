@@ -1,0 +1,141 @@
+import React, { useState } from 'react';
+
+export type ImageSrcResolver = (path: string, base?: string) => string;
+
+/**
+ * Default image URL resolver — Plannotator's local server behavior, verbatim.
+ * Remote URLs pass through; local paths resolve through `/api/image`.
+ */
+const defaultImageSrcResolver: ImageSrcResolver = (path, base) => {
+  if (path.startsWith('http://') || path.startsWith('https://')) {
+    return path; // Remote URL, use directly
+  }
+  let url = `/api/image?path=${encodeURIComponent(path)}`;
+  if (base && !path.startsWith('/')) {
+    url += `&base=${encodeURIComponent(base)}`;
+  }
+  return url;
+};
+
+// Module-level resolver, stable identity. Defaults to Plannotator's behavior so
+// callers and consumers are unchanged. A host (e.g. Workspaces) calls
+// `setImageSrcResolver` once at startup to resolve images via its own backend.
+let imageSrcResolver: ImageSrcResolver = defaultImageSrcResolver;
+
+/** Override how image paths resolve to URLs. Call once at app startup. */
+export const setImageSrcResolver = (resolver: ImageSrcResolver): void => {
+  imageSrcResolver = resolver;
+};
+
+/** Reset to the default (Plannotator local) resolver. Mainly for tests. */
+export const resetImageSrcResolver = (): void => {
+  imageSrcResolver = defaultImageSrcResolver;
+};
+
+/**
+ * Get the display URL for an image path or URL.
+ * Delegates to the active resolver (default = Plannotator `/api/image`).
+ */
+export const getImageSrc = (path: string, base?: string): string =>
+  imageSrcResolver(path, base);
+
+interface ImageThumbnailProps {
+  path: string;
+  size?: 'sm' | 'md' | 'lg';
+  onClick?: () => void;
+  onRemove?: () => void;
+  showRemove?: boolean;
+  className?: string;
+  file?: boolean;
+}
+
+const SIZES = {
+  sm: 'w-6 h-6',
+  md: 'w-10 h-10',
+  lg: 'w-16 h-16',
+};
+
+export const ImageThumbnail: React.FC<ImageThumbnailProps> = ({
+  path,
+  size = 'md',
+  onClick,
+  onRemove,
+  showRemove = true,
+  className = '',
+  file = false,
+}) => {
+  const [error, setError] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const sizeClass = SIZES[size];
+
+  return (
+    <div className={`group relative ${sizeClass} ${className}`}>
+      {file ? (
+        <div
+          onClick={onClick}
+          data-attachment-file=""
+          className={`${sizeClass} rounded border border-border bg-muted flex items-center justify-center text-muted-foreground`}
+        >
+          <svg className="w-1/2 h-1/2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+          </svg>
+        </div>
+      ) : <>
+      {loading && !error && (
+        <div className={`absolute inset-0 bg-muted rounded animate-pulse`} />
+      )}
+
+      {error ? (
+        <div
+          className={`${sizeClass} rounded bg-muted flex items-center justify-center text-muted-foreground`}
+        >
+          <svg
+            className="w-4 h-4"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={1.5}
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z"
+            />
+          </svg>
+        </div>
+      ) : (
+        <img
+          src={getImageSrc(path)}
+          alt="Attachment"
+          loading="lazy"
+          onClick={onClick}
+          onLoad={() => setLoading(false)}
+          onError={() => {
+            setError(true);
+            setLoading(false);
+          }}
+          className={`${sizeClass} rounded object-cover border border-border ${onClick ? 'cursor-pointer hover:opacity-80' : ''}`}
+        />
+      )}
+
+      </>}
+
+      {/* Remove button */}
+      {showRemove && onRemove && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRemove();
+          }}
+          className="absolute -top-1 -right-1 w-4 h-4 bg-destructive text-destructive-foreground rounded-full opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100 transition-opacity flex items-center justify-center"
+        >
+          <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      )}
+    </div>
+  );
+};

@@ -1,0 +1,95 @@
+# Set up the Plannotator Inbox
+
+The Plannotator Inbox is one local window per machine where coding agents leave the person questions, files to annotate and reviews of their work, and the person answers when they can. It runs on `127.0.0.1` only and keeps its data in `~/.plannotator/inbox/`.
+
+You are an agent. Set the Inbox up for the person you work with, connect yourself to it, send them one message and confirm that their reply reached you. Follow the steps in order.
+
+Rules for every step:
+
+- Never run `plannotator uninstall`, never delete files, never stop processes.
+- Never guess a flag. When unsure, run `plannotator --help` or `plannotator inbox --help`. If the CLI and this text disagree, the CLI is right.
+- If a command fails because of a sandbox, missing permissions or no network, stop and give the person the exact command to run in their own terminal.
+- Running this setup twice is safe. Skip any step that is already done.
+
+## 1. Install or update Plannotator
+
+Run `plannotator --version`. If `plannotator` is not found, try `~/.local/bin/plannotator --version` (PowerShell: `& "$env:LOCALAPPDATA\plannotator\plannotator.exe" --version`). If that works, use that path for every command below.
+
+Install Plannotator when it is missing. Update it when the output of `plannotator inbox --help` does not start with `# Plannotator Inbox: a guide for agents` (an older release). The same command does both:
+
+- macOS, Linux, WSL: `curl -fsSL https://plannotator.ai/install.sh | bash -s -- --non-interactive`
+- Windows PowerShell: `& ([scriptblock]::Create((irm https://plannotator.ai/install.ps1))) -NonInteractive`
+
+The installer needs `git` for the slash-command skills. If `git` is missing, add `--skip-skills` (PowerShell: `-SkipSkills`); everything else still installs. The binary goes to `~/.local/bin/plannotator`. If that folder is not on `PATH` in your shell, call the binary by its full path.
+
+Note the absolute path of the binary: `command -v plannotator` (PowerShell: `(Get-Command plannotator).Source`).
+
+## 1b. Name your host and do its own steps
+
+Name your own host first. Your system instructions say which agent you are (Claude Code, Codex, Cursor, VS Code's agent, Zed's agent, Goose, Pi, OpenCode and so on). Tell the person which one you found.
+
+Do only your host's line below, and tell the person what you install. "Before step 2" comes now: step 2 turns on a plugin's tool only if the plugin is there. Its page has the full setup and fixes. Anything else: https://plannotator.ai/llms.txt.
+
+{{AGENT_STEPS}}
+
+## 2. Start the Inbox and open it
+
+1. Run `plannotator inbox --background`. It starts the Inbox without a browser (or finds the running one), prints its URL and exits.
+2. Run `plannotator inbox`. With the Inbox running, it opens the window in the browser, connects the agents it finds on this computer that are not connected yet, and exits. Its stderr names them ("Connected Codex and Gemini CLI to the Inbox"). Keep that line for step 3. If no browser opens (SSH, container, headless), give the person the URL from step 2.1 and tell them to open it on this machine.
+
+## 3. Read the guide and connect yourself
+
+Run `plannotator inbox --help` and read all of it. It is the installed release's guide for agents: the tools, threads and questions.
+
+Use the host you named in step 1b.
+
+- If step 2.2 already connected you, or your host's config already has a `plannotator-inbox` server that runs the `plannotator` binary, you are done here.
+- Otherwise follow the guide's "Connecting yourself" section for your host. Do this even when you are an editor's agent (VS Code, Zed, JetBrains, Goose): `plannotator inbox` never changes editors by itself, so you add the entry for yourself. Use the absolute path from step 1 wherever a command names `plannotator`.
+- If you notice other editors or agents on this computer that are not connected, ask the person before you add an entry for any of them, and add only the ones they agree to.
+
+Tell the person when a restart is needed. A connection takes effect when a session starts, never in the session that is running now. Do not wait for it: step 4 works without it.
+
+## 3b. The note in each agent's instructions
+
+Plannotator adds a short note about the Inbox to each agent's own instructions file, so agents send decisions and finished work there while the person is away. The guide's "A note in each agent's instructions" section lists every file it would write on this computer and whether it adds a marked section or creates the file.
+
+The Inbox adds the note by itself for Claude Code, Codex, Gemini CLI, Pi and OpenCode. Do not ask about those; at most, tell the person which files got it.
+
+1. Show the person the Qwen Code and Cursor rows of that list (agent and exact path) and ask which of them should get the note. Cursor's note is pasted by hand.
+2. Only with their yes in this chat, run `plannotator inbox --notes <ids>` with only the agents they agreed to, comma-separated (for example `plannotator inbox --notes qwen,cursor`). It prints what it wrote, or for Cursor the note to paste.
+3. Without a yes, run nothing. The Inbox window asks the person once itself.
+
+## 4. Send the first message
+
+If you have a tool whose name ends in `plannotator_inbox`, call it with `action: "send_message"` plus the fields of the `arguments` object below as top-level fields, leaving out `agent_name` and `agent_host` (the tool fills them). Every later call in this setup (`read_thread`, `resolve_message`) works the same way: `action` set to the MCP tool's name, its fields beside it. Otherwise send through the stdio MCP command, which works from any shell:
+
+1. Write the JSON below to a temporary file as ONE line, for example `/tmp/plannotator-inbox-first.json`. Use your file-writing tool, not `echo` (some shells rewrite `\n`). Replace `AGENT_NAME` (how the person knows you, e.g. "Codex") and `AGENT_HOST` (e.g. `codex`; also in the `idempotency_key`).
+2. From the person's project folder, run `plannotator inbox mcp < /tmp/plannotator-inbox-first.json` (PowerShell: `Get-Content /path/to/file | plannotator inbox mcp`). It prints one JSON-RPC answer. Keep `result.structuredContent.thread_id`.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"subject":"Your Plannotator Inbox is set up","agent_name":"AGENT_NAME","agent_host":"AGENT_HOST","idempotency_key":"plannotator-inbox-first-v1-AGENT_HOST","body":"This is your Plannotator Inbox. Agents leave you questions, files to annotate and reviews of their work here while they keep working.\n\nClick a choice to answer, then press **Send** (Cmd or Ctrl + Enter). Nothing reaches the agent until you send.\n\n:::question\nWant me to send some of our recent work here so you can see how it works?\n\n- [ ] Yes, send something from what we are working on\n- [ ] No, the setup is enough for now\n\nRecommended: Yes, send something from what we are working on\n:::"}}}
+```
+
+If the answer says "Already sent", this setup ran before. Read the thread (`read_thread` with the `thread_id`, sent the same way) and skip step 5 if the person already replied.
+
+Tell the person: "Your Inbox is set up and I sent you a first message there. Pick an answer and press Send."
+
+## 5. Get the reply and act on it
+
+The send result says whether the reply arrives in this session by itself. If it does, end your turn. If it does not, ask the person to say "done" when they have sent it and end your turn. Then call `read_thread` with the `thread_id`, the same way you sent the message:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_thread","arguments":{"thread_id":"THREAD_ID"}}}
+```
+
+When you have the reply, quote it back to the person to show the round trip worked. Then resolve the first thread with `resolve_message` (`message_id` = its `thread_id`). It moves to Quiet and nothing is deleted. Your next message starts a new thread.
+
+- **Yes:** send one or two real messages from what you and the person are actually working on in this project: an open decision written as a `:::question` block (the syntax is in `plannotator inbox --help`), and, if there is one, a plan or document you wrote, attached with `attachments: ["path"]` so they can annotate it. Never send a bare question: give it one to three plain sentences of context (what it affects, what you know, why you recommend what you do), attach the files it points to and link them from it (`[the mock](mock.html)` opens the file beside the thread), and add a screenshot (`![alt](path)`) when it is about something visual. Keep them short and real. Never invent work, and never send secrets or `.env` files. If this session has no work to draw on, say so and send nothing more.
+- **No:** do nothing more.
+
+## 6. Tell the person, in plain words
+
+- Where replies go: to the session that asked. Agents with a Plannotator plugin (Claude Code, Pi, OpenCode 2, DeepSeek Harness, Cline, OpenClaw, Hermes Agent), Codex 0.149 or later, Qwen Code 0.24 or later on macOS and Linux, Claude threads in T3 Code, and Antigravity conversations (in agy, once the agent runs `plannotator inbox antigravity` as its send result says) get the reply as a new turn once idle. Other agents read it when they call `read_thread`. Say which one applies to you: the send result in step 4 said it.
+- Notifications: the open Inbox page can show a browser notification when a question arrives while its tab is in the background. It asks once. Change it in the Inbox's Settings.
+- Local only: the Inbox listens on `127.0.0.1`. Threads, answers and attached files are files in `~/.plannotator/inbox/`. Nothing leaves the machine.
+- Opening it later: `plannotator inbox`. Agents start a stopped Inbox in the background when they write to it.
